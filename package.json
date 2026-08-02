@@ -1,0 +1,13 @@
+{
+    "name": "destiny-stream-phone-line",
+    "version": "1.0.0",
+    "description": "A Twilio-friendly phone service for one Kick streamer",
+    "main": "server.js",
+    "engines": {
+        "node": ">=20"
+    },
+    "scripts": {
+        "start": "node scripts/start.js",
+        "test": "node --test"
+    }
+}
