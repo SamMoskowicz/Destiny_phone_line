@@ -382,6 +382,16 @@ for (const recording of service.state.recordings) {
     }
 }
 
+// Hitting all 5 video pages back-to-back looked bot-like enough to be part of
+// what triggers Cloudflare's challenge on that route - don't retry a video
+// that just failed again next cycle (every 15 min) while it's still likely
+// blocked, and space out attempts within a run instead of bursting them.
+const KICK_VIDEO_RETRY_BACKOFF_MS = 60 * 60 * 1000;
+const KICK_VIDEO_MIN_SPACING_MS = 60 * 1000;
+const KICK_VIDEO_MAX_SPACING_MS = 3 * 60 * 1000;
+const recentlyFailedKickVideoIds = new Map(); // videoId -> failedAt
+let pollingVideosInProgress = false;
+
 async function pollKickVideos() {
     // Chrome (Puppeteer) and ffmpeg competing for the same CPU core can stall
     // audio delivery to an actively-listening caller badly enough that Twilio
@@ -389,8 +399,15 @@ async function pollKickVideos() {
     if (activeLiveRequests.size > 0) {
         return;
     }
+    // A run can now take several minutes (spacing below), so guard against
+    // the next scheduled tick starting a second run on top of one still going.
+    if (pollingVideosInProgress) {
+        return;
+    }
+    pollingVideosInProgress = true;
     try {
         const videoIds = await kickBrowser.listRecentVideoIds(KICK_CHANNEL, 5);
+        let attemptedAny = false;
         for (const videoId of videoIds) {
             // Re-checked per video (not just once at the top) - archiving all
             // 5 can take minutes, and a caller can connect to the live stream
@@ -402,6 +419,22 @@ async function pollKickVideos() {
             if (archivedKickVideoIds.has(videoId)) {
                 continue;
             }
+            const failedAt = recentlyFailedKickVideoIds.get(videoId);
+            if (failedAt && Date.now() - failedAt < KICK_VIDEO_RETRY_BACKOFF_MS) {
+                continue;
+            }
+
+            if (attemptedAny) {
+                const delayMs = KICK_VIDEO_MIN_SPACING_MS
+                    + Math.random() * (KICK_VIDEO_MAX_SPACING_MS - KICK_VIDEO_MIN_SPACING_MS);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+                if (activeLiveRequests.size > 0) {
+                    console.log('Pausing Kick video archiving: a caller is listening live');
+                    return;
+                }
+            }
+            attemptedAny = true;
+
             try {
                 const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, videoId);
                 service.addRecording({
@@ -411,17 +444,21 @@ async function pollKickVideos() {
                     kickVideoId: videoId
                 });
                 archivedKickVideoIds.add(videoId);
+                recentlyFailedKickVideoIds.delete(videoId);
                 // Reuse the URL we just paid the Puppeteer cost to fetch, so
                 // the cache is already warm - a caller shouldn't be the one
                 // to trigger the first (slow) resolution for a recording.
                 vodUrlCache.set(videoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
                 console.log(`Archived Kick video ${videoId}: ${info.title}`);
             } catch (error) {
+                recentlyFailedKickVideoIds.set(videoId, Date.now());
                 console.error(`Failed to archive Kick video ${videoId}: ${error.message}`);
             }
         }
     } catch (error) {
         console.error(`Kick videos poll failed: ${error.message}`);
+    } finally {
+        pollingVideosInProgress = false;
     }
 }
 
