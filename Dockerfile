@@ -6,6 +6,7 @@ FROM node:22-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fonts-liberation \
+    ffmpeg \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -34,6 +35,12 @@ WORKDIR /app
 # download during the build to one path and then be looked for at another,
 # failing with "Could not find Chrome" at runtime.
 ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
+
+# Use the apt-installed ffmpeg (current, Debian-maintained) instead of the
+# bundled @ffmpeg-installer/ffmpeg Linux binary, which is a static build from
+# 2018 that crashes (killed by a signal, no error output) on the unusually
+# long signed URLs Kick's VOD playback endpoint returns.
+ENV FFMPEG_PATH=ffmpeg
 
 COPY package*.json ./
 RUN npm install --omit=dev

@@ -5,6 +5,10 @@ const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const { PhoneService } = require('./src/phoneService');
 const kickBrowser = require('./src/kickBrowser');
 
+// Prefer an explicit system ffmpeg (set via Dockerfile on Render) over the
+// bundled @ffmpeg-installer/ffmpeg binary - see Dockerfile for why.
+const FFMPEG_PATH = process.env.FFMPEG_PATH || ffmpegInstaller.path;
+
 const service = new PhoneService({
     streamerName: process.env.STREAMER_NAME || 'Destiny',
     storageFile: process.env.PHONE_SERVICE_STATE_FILE || undefined
@@ -25,7 +29,7 @@ function startLiveRelay(hlsUrl) {
         return;
     }
 
-    const proc = spawn(ffmpegInstaller.path, [
+    const proc = spawn(FFMPEG_PATH, [
         '-re',
         '-i', hlsUrl,
         '-vn',
@@ -385,7 +389,7 @@ const server = http.createServer(async (req, res) => {
         const resolveMs = Date.now() - startedAt;
 
         const ffmpegStartedAt = Date.now();
-        const proc = spawn(ffmpegInstaller.path, [
+        const proc = spawn(FFMPEG_PATH, [
             '-loglevel', 'verbose',
             '-i', audioUrl,
             '-t', '3',
@@ -530,7 +534,7 @@ const server = http.createServer(async (req, res) => {
         // Seeking into a static recording is a one-off per-caller ffmpeg process
         // (unlike the fan-out live relay) since each caller can be at a different
         // position - -ss before -i does an efficient input-side seek.
-        const proc = spawn(ffmpegInstaller.path, [
+        const proc = spawn(FFMPEG_PATH, [
             '-ss', String(start),
             '-i', audioUrl,
             '-vn',
