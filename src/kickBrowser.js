@@ -115,12 +115,15 @@ async function getVodPlaybackInfo(slug, videoId) {
         await new Promise((resolve) => setTimeout(resolve, 1500));
 
         const videoHandle = await page.$('video');
+        let clicked = false;
         if (videoHandle) {
             const box = await videoHandle.boundingBox();
             if (box) {
                 await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+                clicked = true;
             } else {
                 await videoHandle.click();
+                clicked = true;
             }
         }
 
@@ -130,7 +133,21 @@ async function getVodPlaybackInfo(slug, videoId) {
         }
 
         if (!captured) {
-            throw new Error(`Timed out waiting for playback info on video ${videoId}`);
+            // Grab enough of the page state to tell WHY the click didn't lead
+            // to a playback response - a UI/consent overlay, a bot-detection
+            // block page, or a page structure change - instead of guessing
+            // blind on the next failure.
+            const debugInfo = await page.evaluate(() => ({
+                title: document.title,
+                url: window.location.href,
+                hasVideoTag: Boolean(document.querySelector('video')),
+                bodyTextSnippet: document.body ? document.body.innerText.slice(0, 400) : null
+            })).catch((error) => ({ evaluateError: error.message }));
+            throw new Error(
+                `Timed out waiting for playback info on video ${videoId} `
+                + `(videoElementFoundOnLoad=${Boolean(videoHandle)}, clicked=${clicked}) `
+                + `debug=${JSON.stringify(debugInfo)}`
+            );
         }
 
         const session = captured.video_session || {};
