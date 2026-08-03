@@ -432,6 +432,7 @@ const server = http.createServer(async (req, res) => {
             '-loglevel', 'verbose',
             '-ss', '0',
             '-i', audioUrl,
+            '-t', String(ARCHIVE_CHUNK_SECONDS),
             '-vn',
             '-c:a', 'libmp3lame',
             '-b:a', '96k',
