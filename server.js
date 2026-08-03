@@ -133,6 +133,14 @@ function ensureLiveRelay() {
 }
 
 async function pollKickChannel() {
+    // Runs every 90s forever, so unlike the archiving polls this one can't
+    // just be delayed until nobody's listening - it would starve a long call
+    // repeatedly. Skipping it while someone's live means we won't notice the
+    // stream ending mid-call, but ffmpeg will exit on its own once the source
+    // actually goes away, which the existing exit handler already covers.
+    if (liveRelayClients.size > 0) {
+        return;
+    }
     try {
         const { isLive, hlsUrl } = await kickBrowser.checkLiveStatus(KICK_CHANNEL);
 
