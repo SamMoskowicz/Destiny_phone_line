@@ -342,6 +342,26 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Shows the current archive list (metadata only, no playback URLs) so we
+    // can tell whether pollKickVideos has actually populated anything without
+    // needing a real phone call to find out.
+    if (req.url === '/diagnostics/recordings') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: true,
+            isLive: service.state.isLive,
+            recordings: service.state.recordings.map((entry) => ({
+                id: entry.id,
+                title: entry.title,
+                live: entry.live,
+                kickVideoId: entry.kickVideoId || null,
+                durationSeconds: entry.durationSeconds,
+                startedAt: entry.startedAt
+            }))
+        }));
+        return;
+    }
+
     // Temporary: shows exactly what this container sees for the Chromium
     // cache location, to tell apart "the fix didn't deploy" from "the fix
     // deployed but doesn't work". Safe to remove once the Chrome issue is resolved.
