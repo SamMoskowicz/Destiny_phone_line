@@ -184,10 +184,128 @@ async function reconnectLiveTranscode() {
 // Same reasoning applies to archived recordings: without a bound, ffmpeg
 // would try to stream from the seek position all the way to the end of a
 // potentially multi-hour VOD in one response, which Twilio can't wait out
-// any better than an infinite live stream. Archives don't get the persistent-
-// connection treatment live does, since each caller can be at a different
-// seek position - there's no single shared stream to keep warm.
-const ARCHIVE_CHUNK_SECONDS = 18;
+// any better than an infinite live stream. Unlike live, there's no single
+// shared stream to keep warm (each caller can be at a different position) -
+// but each CALLER still gets a persistent, per-session ffmpeg process that
+// keeps transcoding forward in the background between chunk requests, so
+// repeat/continuing requests don't pay a fresh reconnect+reseek cost every
+// ~18s the way a stateless per-request spawn would.
+const ARCHIVE_CHUNK_SECONDS = 60;
+const ARCHIVE_AUDIO_BYTES_PER_SECOND = (96 * 1000) / 8; // matches -b:a 96k below
+const ARCHIVE_CHUNK_BYTES = ARCHIVE_AUDIO_BYTES_PER_SECOND * ARCHIVE_CHUNK_SECONDS;
+// How much drift to tolerate between the position handlePlaybackControl
+// expects (tracked via wall-clock elapsed time) and where the persistent
+// transcode has actually gotten to, before treating a request as a real seek
+// (which requires killing and respawning at the new position) rather than a
+// natural continuation of the same session.
+const ARCHIVE_POSITION_TOLERANCE_SECONDS = 5;
+// A session nobody has reattached to for this long is assumed abandoned
+// (caller hung up, went to the menu, or switched recordings) and is torn
+// down so its ffmpeg process and Kick CDN connection don't leak forever.
+const ARCHIVE_SESSION_IDLE_MS = 90 * 1000;
+const archiveSessions = new Map(); // caller phone number -> session
+
+function stopArchiveSession(phoneNumber) {
+    const session = archiveSessions.get(phoneNumber);
+    if (!session) {
+        return;
+    }
+    archiveSessions.delete(phoneNumber);
+    if (session.process && !session.process.killed) {
+        session.process.kill('SIGKILL');
+    }
+    if (session.currentRes && !session.currentRes.writableEnded) {
+        session.currentRes.end();
+    }
+}
+
+function startArchiveSession(phoneNumber, recordingId, audioUrl, startSeconds) {
+    stopArchiveSession(phoneNumber);
+
+    const proc = spawn(FFMPEG_PATH, [
+        '-ss', String(startSeconds),
+        '-i', audioUrl,
+        '-vn',
+        '-c:a', 'libmp3lame',
+        '-b:a', '96k',
+        '-ar', '44100',
+        '-f', 'mp3',
+        '-'
+    ], { stdio: ['ignore', 'pipe', 'inherit'] });
+
+    const session = {
+        recordingId,
+        process: proc,
+        currentRes: null,
+        bytesSentForCurrentRes: 0,
+        startSeconds,
+        bytesProducedTotal: 0,
+        lastAttachedAt: Date.now(),
+        pending: []
+    };
+    archiveSessions.set(phoneNumber, session);
+
+    proc.on('error', (error) => {
+        console.error(`archive transcode error for ${phoneNumber}: ${error.message}`);
+    });
+
+    proc.on('exit', (code, signal) => {
+        console.error(`archive transcode for ${phoneNumber} exited with code=${code} signal=${signal}`);
+        if (archiveSessions.get(phoneNumber) === session) {
+            archiveSessions.delete(phoneNumber);
+            if (session.currentRes && !session.currentRes.writableEnded) {
+                session.currentRes.end();
+            }
+        }
+    });
+
+    proc.stdout.on('data', (chunk) => {
+        session.bytesProducedTotal += chunk.length;
+        if (session.currentRes && !session.currentRes.writableEnded) {
+            session.currentRes.write(chunk);
+            session.bytesSentForCurrentRes += chunk.length;
+            if (session.bytesSentForCurrentRes >= ARCHIVE_CHUNK_BYTES) {
+                session.currentRes.end();
+                session.currentRes = null;
+                session.lastAttachedAt = Date.now();
+            }
+        } else {
+            // Nobody's attached right now (between chunk requests) - queue a
+            // little so the next request can start instantly, but stop once
+            // there's a full chunk's worth ready rather than buffering the
+            // rest of the VOD in memory. Node applies real backpressure to
+            // ffmpeg's own stdout write() once we stop draining it.
+            session.pending.push(chunk);
+            const pendingBytes = session.pending.reduce((sum, c) => sum + c.length, 0);
+            if (pendingBytes >= ARCHIVE_CHUNK_BYTES) {
+                proc.stdout.pause();
+            }
+        }
+    });
+
+    return session;
+}
+
+function attachArchiveResponse(session, res) {
+    session.currentRes = res;
+    session.bytesSentForCurrentRes = 0;
+    session.lastAttachedAt = Date.now();
+
+    while (session.pending.length && session.bytesSentForCurrentRes < ARCHIVE_CHUNK_BYTES) {
+        const chunk = session.pending.shift();
+        res.write(chunk);
+        session.bytesSentForCurrentRes += chunk.length;
+    }
+
+    if (session.bytesSentForCurrentRes >= ARCHIVE_CHUNK_BYTES) {
+        res.end();
+        session.currentRes = null;
+    }
+
+    if (session.process.stdout.isPaused()) {
+        session.process.stdout.resume();
+    }
+}
 
 function getRequestBaseUrl(req = null) {
     const configured = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
@@ -210,10 +328,11 @@ function buildLivePlaybackUrl(req = null) {
     return `${baseUrl}/live.mp3`;
 }
 
-function buildRecordingPlaybackUrl(req, recordingId, startSeconds) {
+function buildRecordingPlaybackUrl(req, recordingId, startSeconds, phoneNumber) {
     const baseUrl = getRequestBaseUrl(req) || `http://localhost:${process.env.PORT || 3000}`;
     const start = Math.max(0, Math.floor(startSeconds || 0));
-    return `${baseUrl}/recordings/${encodeURIComponent(recordingId)}/play?start=${start}`;
+    const caller = encodeURIComponent(phoneNumber || 'unknown-caller');
+    return `${baseUrl}/recordings/${encodeURIComponent(recordingId)}/play?start=${start}&caller=${caller}`;
 }
 
 async function pollKickChannel() {
@@ -424,7 +543,7 @@ function handleVoiceRequest(req, res, body) {
             return;
         }
 
-        const playUrl = buildRecordingPlaybackUrl(req, action.recordingId, action.positionSeconds);
+        const playUrl = buildRecordingPlaybackUrl(req, action.recordingId, action.positionSeconds, phoneNumber);
         sendTwiml(res, service.buildPlaybackTwiML(null, playUrl));
         return;
     }
@@ -442,7 +561,7 @@ function handleVoiceRequest(req, res, body) {
                 sendTwiml(res, service.buildMenuTwiML(recordingResult.message));
                 return;
             }
-            const playUrl = buildRecordingPlaybackUrl(req, recordingResult.recordingId, recordingResult.positionSeconds);
+            const playUrl = buildRecordingPlaybackUrl(req, recordingResult.recordingId, recordingResult.positionSeconds, phoneNumber);
             sendTwiml(res, service.buildPlaybackTwiML(recordingResult.message, playUrl));
             return;
         }
@@ -669,6 +788,7 @@ const server = http.createServer(async (req, res) => {
 
         const query = new URLSearchParams(match[2] || '');
         const start = Math.max(0, Number(query.get('start')) || 0);
+        const caller = query.get('caller') || 'unknown-caller';
 
         let audioUrl;
         try {
@@ -692,35 +812,31 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        // Seeking into a static recording is a one-off per-caller ffmpeg process
-        // (unlike the fan-out live relay) since each caller can be at a different
-        // position - -ss before -i does an efficient input-side seek. Bounded to
-        // ARCHIVE_CHUNK_SECONDS for the same reason live is chunked; the TwiML
-        // auto-continues from wherever this chunk leaves off (see
-        // handlePlaybackControl's default digit path).
-        const proc = spawn(FFMPEG_PATH, [
-            '-ss', String(start),
-            '-i', audioUrl,
-            '-t', String(ARCHIVE_CHUNK_SECONDS),
-            '-vn',
-            '-c:a', 'libmp3lame',
-            '-b:a', '96k',
-            '-ar', '44100',
-            '-f', 'mp3',
-            '-'
-        ], { stdio: ['ignore', 'pipe', 'inherit'] });
-
-        proc.on('error', (error) => {
-            console.error('recording relay error:', error);
-            if (!res.writableEnded) {
-                res.end();
+        // Reuse this caller's existing session if it's the same recording and
+        // picking up right where its persistent transcode has actually gotten
+        // to (a natural chunk-boundary continuation) - only a real seek/jump
+        // or a switch to a different recording pays the reconnect+reseek cost.
+        let session = archiveSessions.get(caller);
+        if (session) {
+            const expectedPosition = session.startSeconds + (session.bytesProducedTotal / ARCHIVE_AUDIO_BYTES_PER_SECOND);
+            const reusable = session.recordingId === recordingId
+                && session.process
+                && !session.process.killed
+                && Math.abs(expectedPosition - start) <= ARCHIVE_POSITION_TOLERANCE_SECONDS;
+            if (!reusable) {
+                session = null;
             }
-        });
+        }
+        if (!session) {
+            session = startArchiveSession(caller, recordingId, audioUrl, start);
+        }
 
-        proc.stdout.pipe(res);
+        attachArchiveResponse(session, res);
 
         req.on('close', () => {
-            proc.kill('SIGKILL');
+            if (session.currentRes === res) {
+                session.currentRes = null;
+            }
         });
 
         return;
@@ -823,10 +939,25 @@ server.listen(port, () => {
     } else {
         console.log('KICK_CHANNEL not set - start/stop the live stream manually via POST /admin/stream/live and /admin/stream/stop');
     }
+
+    // Sweeps archive sessions nobody has reattached to in a while (hangup,
+    // switched recordings, went to the menu) so their ffmpeg process and Kick
+    // CDN connection don't stay open indefinitely.
+    setInterval(() => {
+        const now = Date.now();
+        for (const [phoneNumber, session] of archiveSessions) {
+            if (!session.currentRes && now - session.lastAttachedAt > ARCHIVE_SESSION_IDLE_MS) {
+                stopArchiveSession(phoneNumber);
+            }
+        }
+    }, 30000);
 });
 
 async function shutdown() {
     stopLiveTranscode();
+    for (const phoneNumber of Array.from(archiveSessions.keys())) {
+        stopArchiveSession(phoneNumber);
+    }
     await kickBrowser.shutdown();
     server.close(() => process.exit(0));
 }

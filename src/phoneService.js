@@ -50,7 +50,7 @@ class PhoneService {
         const liveLine = this.state.isLive
             ? `To hear Destiny's live stream, press 1.`
             : `There is no live stream right now.`;
-        return `${liveLine} Press 2 through 6 for the last five archived streams. Press 7 to hear the playback controls.`;
+        return `${liveLine} Press 2 through 6 for the last five archived streams, from most recent to oldest. Press 7 to hear the playback controls.`;
     }
 
     getControlsInfoPrompt() {
@@ -289,26 +289,26 @@ class PhoneService {
             return { type: 'menu' };
         }
 
+        if (recording.live) {
+            // Pause/skip/rewind don't apply to a live broadcast - there's no
+            // position to seek to or pause-and-resume from. Every key except
+            // 8 (menu, handled above) is a no-op that just keeps the caller
+            // listening to the current live point.
+            this.startSegment(caller, recording.id, 0);
+            this.saveState();
+            return { type: 'live-resume', recordingId: recording.id };
+        }
+
         if (digit === '2') {
             if (caller.segmentStartedAt) {
                 this.pauseSegment(caller);
                 this.saveState();
                 return { type: 'paused', message: 'Paused. Press 2 to resume.' };
             }
-            const resumePosition = recording.live ? 0 : (caller.lastPositionSeconds || 0);
+            const resumePosition = caller.lastPositionSeconds || 0;
             this.startSegment(caller, recording.id, resumePosition);
             this.saveState();
-            return recording.live
-                ? { type: 'live-resume', recordingId: recording.id }
-                : { type: 'seek', recordingId: recording.id, positionSeconds: resumePosition };
-        }
-
-        if (recording.live) {
-            // Live can't be seeked or paused-and-resumed-from-position; any other
-            // key just keeps the caller listening to the current live point.
-            this.startSegment(caller, recording.id, 0);
-            this.saveState();
-            return { type: 'live-resume', recordingId: recording.id };
+            return { type: 'seek', recordingId: recording.id, positionSeconds: resumePosition };
         }
 
         const deltaSeconds = {
