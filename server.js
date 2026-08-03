@@ -344,11 +344,12 @@ function buildLivePlaybackUrl(req = null) {
     return `${baseUrl}/live.mp3`;
 }
 
-function buildRecordingPlaybackUrl(req, recordingId, startSeconds, phoneNumber) {
+function buildRecordingPlaybackUrl(req, recordingId, startSeconds, phoneNumber, isContinue = false) {
     const baseUrl = getRequestBaseUrl(req) || `http://localhost:${process.env.PORT || 3000}`;
     const start = Math.max(0, Math.floor(startSeconds || 0));
     const caller = encodeURIComponent(phoneNumber || 'unknown-caller');
-    return `${baseUrl}/recordings/${encodeURIComponent(recordingId)}/play?start=${start}&caller=${caller}`;
+    const continueParam = isContinue ? '&continue=1' : '';
+    return `${baseUrl}/recordings/${encodeURIComponent(recordingId)}/play?start=${start}&caller=${caller}${continueParam}`;
 }
 
 async function pollKickChannel() {
@@ -580,7 +581,9 @@ function handleVoiceRequest(req, res, body) {
             return;
         }
 
-        const playUrl = buildRecordingPlaybackUrl(req, action.recordingId, action.positionSeconds, phoneNumber);
+        const playUrl = buildRecordingPlaybackUrl(
+            req, action.recordingId, action.positionSeconds, phoneNumber, action.type === 'continue'
+        );
         sendTwiml(res, service.buildPlaybackTwiML(null, playUrl));
         return;
     }
@@ -829,6 +832,7 @@ const server = http.createServer(async (req, res) => {
         const query = new URLSearchParams(match[2] || '');
         const start = Math.max(0, Number(query.get('start')) || 0);
         const caller = query.get('caller') || 'unknown-caller';
+        const isContinue = query.get('continue') === '1';
 
         let audioUrl;
         try {
@@ -852,17 +856,24 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        // Reuse this caller's existing session if it's the same recording and
-        // picking up right where its persistent transcode has actually gotten
-        // to (a natural chunk-boundary continuation) - only a real seek/jump
-        // or a switch to a different recording pays the reconnect+reseek cost.
+        // A natural chunk-boundary continuation (isContinue) trusts the
+        // caller's session as-is and never reconnects - no position
+        // comparison at all, since the only position we could compare
+        // against is a wall-clock estimate that drifts a little further off
+        // with every chunk transition (Twilio's inter-chunk pause isn't
+        // audio time), which would eventually misfire as a "seek" on a
+        // plain, uninterrupted listen. An explicit seek/skip always pays the
+        // reconnect+reseek cost, since it's a genuine jump to a new position.
         let session = archiveSessions.get(caller);
         if (session) {
-            const expectedPosition = session.startSeconds + (session.bytesProducedTotal / ARCHIVE_AUDIO_BYTES_PER_SECOND);
-            const reusable = session.recordingId === recordingId
+            const sameRecording = session.recordingId === recordingId
                 && session.process
-                && !session.process.killed
-                && Math.abs(expectedPosition - start) <= ARCHIVE_POSITION_TOLERANCE_SECONDS;
+                && !session.process.killed;
+            const reusable = isContinue
+                ? sameRecording
+                : sameRecording && Math.abs(
+                    (session.startSeconds + session.bytesProducedTotal / ARCHIVE_AUDIO_BYTES_PER_SECOND) - start
+                ) <= ARCHIVE_POSITION_TOLERANCE_SECONDS;
             if (!reusable) {
                 session = null;
             }

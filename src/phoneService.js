@@ -92,8 +92,10 @@ class PhoneService {
         // with no keypress posts empty Digits there, which handlePlaybackControl's
         // default path treats as "continue from the current position" - that's
         // what makes an archived recording keep playing across chunk boundaries
-        // instead of dropping to the menu every ~18 seconds.
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="2" finishOnKey="">${say}${audioSection}\n  </Gather>\n  <Redirect>/voice/playback</Redirect>\n</Response>`;
+        // instead of dropping to the menu every ~60 seconds. timeout="1" (as
+        // low as Twilio allows) matches the live path - keeps the dead air
+        // between chunks as short as possible while still catching a keypress.
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="1" finishOnKey="">${say}${audioSection}\n  </Gather>\n  <Redirect>/voice/playback</Redirect>\n</Response>`;
     }
 
     buildPausedTwiML(message) {
@@ -346,6 +348,18 @@ class PhoneService {
 
         this.startSegment(caller, recording.id, nextPosition);
         this.saveState();
+
+        if (deltaSeconds === undefined) {
+            // No recognized seek key was pressed (natural chunk-end, or an
+            // unmapped key) - positionSeconds here is only a wall-clock
+            // estimate that drifts a little further off with every chunk
+            // transition (Twilio's inter-chunk pause isn't audio time), so
+            // server.js's persistent archive session should just keep
+            // playing from wherever it actually is rather than treating this
+            // as a real seek and reconnecting once that drift adds up.
+            return { type: 'continue', recordingId: recording.id, positionSeconds: nextPosition };
+        }
+
         return { type: 'seek', recordingId: recording.id, positionSeconds: nextPosition };
     }
 }
