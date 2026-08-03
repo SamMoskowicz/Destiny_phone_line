@@ -43,8 +43,16 @@ function startLiveTranscode(hlsUrl) {
         return;
     }
 
+    // No -re: Twilio's <Play> appears to fully download a chunk before
+    // playing any of it, rather than streaming progressively as bytes
+    // arrive. Pacing our output to real-time therefore just makes the
+    // silent "download" phase as long as the chunk itself (measured as an
+    // alternating ~20s-silent/~20s-audio pattern) - deliver as fast as
+    // possible instead and let Twilio pace the actual playback. Live input
+    // still can't outrun the broadcast itself (new segments only exist once
+    // Kick's encoder produces them), so this doesn't risk racing ahead in
+    // steady state - only removes an artificial slowdown.
     const proc = spawn(FFMPEG_PATH, [
-        '-re',
         '-i', hlsUrl,
         '-vn',
         '-c:a', 'libmp3lame',
