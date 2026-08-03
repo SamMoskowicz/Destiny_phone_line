@@ -25,6 +25,11 @@ const KICK_VIDEOS_POLL_MAX_INTERVAL_MS = Number(
     process.env.KICK_VIDEOS_POLL_MAX_INTERVAL_MS || KICK_VIDEOS_POLL_MIN_INTERVAL_MS * 2
 );
 const KICK_VOD_URL_TTL_MS = 45 * 60 * 1000;
+// How far ahead of actually going stale (KICK_VOD_URL_TTL_MS) a cached
+// playback URL gets proactively refreshed - wide enough that a warming pass
+// every ~15-30 min (the video-poll cadence) reliably catches it before a
+// caller would ever hit the slow/fragile on-demand path.
+const KICK_VOD_WARM_MARGIN_MS = 15 * 60 * 1000;
 
 let liveRelayUrl = process.env.LIVE_HLS_URL || null;
 
@@ -433,33 +438,63 @@ async function pollKickVideos() {
             return !failedAt || Date.now() - failedAt >= KICK_VIDEO_RETRY_BACKOFF_MS;
         });
 
-        if (!nextVideoId) {
+        if (nextVideoId) {
+            try {
+                const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, nextVideoId);
+                service.addRecording({
+                    title: info.title || `${service.streamerName} archived stream`,
+                    audioUrl: info.audioUrl,
+                    durationSeconds: info.durationSeconds || 0,
+                    kickVideoId: nextVideoId
+                });
+                archivedKickVideoIds.add(nextVideoId);
+                recentlyFailedKickVideoIds.delete(nextVideoId);
+                // Reuse the URL we just paid the Puppeteer cost to fetch, so
+                // the cache is already warm - a caller shouldn't be the one
+                // to trigger the first (slow) resolution for a recording.
+                vodUrlCache.set(nextVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
+                console.log(`Archived Kick video ${nextVideoId}: ${info.title}`);
+            } catch (error) {
+                recentlyFailedKickVideoIds.set(nextVideoId, Date.now());
+                console.error(`Failed to archive Kick video ${nextVideoId}: ${error.message}`);
+            }
             return;
         }
 
-        try {
-            const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, nextVideoId);
-            service.addRecording({
-                title: info.title || `${service.streamerName} archived stream`,
-                audioUrl: info.audioUrl,
-                durationSeconds: info.durationSeconds || 0,
-                kickVideoId: nextVideoId
-            });
-            archivedKickVideoIds.add(nextVideoId);
-            recentlyFailedKickVideoIds.delete(nextVideoId);
-            // Reuse the URL we just paid the Puppeteer cost to fetch, so
-            // the cache is already warm - a caller shouldn't be the one
-            // to trigger the first (slow) resolution for a recording.
-            vodUrlCache.set(nextVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
-            console.log(`Archived Kick video ${nextVideoId}: ${info.title}`);
-        } catch (error) {
-            recentlyFailedKickVideoIds.set(nextVideoId, Date.now());
-            console.error(`Failed to archive Kick video ${nextVideoId}: ${error.message}`);
-        }
+        // Nothing new to discover this cycle - spend this same one-visit
+        // budget keeping an existing recording's cached playback URL warm
+        // instead, so a caller pressing play isn't the one who discovers
+        // Cloudflare is blocking a resolution. Still just one Kick
+        // video-page visit per cycle either way, never both in the same run.
+        await warmStalestVodUrl();
     } catch (error) {
         console.error(`Kick videos poll failed: ${error.message}`);
     } finally {
         pollingVideosInProgress = false;
+    }
+}
+
+async function warmStalestVodUrl() {
+    const kickRecordings = service.state.recordings.filter((entry) => entry.kickVideoId && !entry.live);
+    let target = null;
+    let targetAge = -1;
+    for (const recording of kickRecordings) {
+        const cached = vodUrlCache.get(recording.kickVideoId);
+        const age = cached ? Date.now() - cached.resolvedAt : Infinity;
+        if (age > targetAge) {
+            targetAge = age;
+            target = recording;
+        }
+    }
+    if (!target || (targetAge !== Infinity && targetAge < KICK_VOD_URL_TTL_MS - KICK_VOD_WARM_MARGIN_MS)) {
+        return;
+    }
+    try {
+        const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, target.kickVideoId);
+        vodUrlCache.set(target.kickVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
+        console.log(`Pre-warmed playback URL for Kick video ${target.kickVideoId}`);
+    } catch (error) {
+        console.error(`Failed to warm playback URL for ${target.kickVideoId}: ${error.message}`);
     }
 }
 
@@ -474,16 +509,13 @@ function scheduleNextKickVideosPoll() {
 
 // The VOD playback URL Kick hands back is signed with a token that expires
 // ~1 hour after issuance, so it can't be stored permanently like an
-// admin-provided direct link. It's kept warm by pollKickVideos at archive
-// time, then resolved lazily here on whatever cadence callers actually play
-// a given recording - deliberately NOT proactively refreshed on a timer,
-// since that would mean periodically re-visiting Kick's more heavily
-// bot-protected video-detail page for every archived recording regardless of
-// whether anyone's about to listen, which is exactly the kind of traffic
-// pattern that seems to trigger Cloudflare's challenge on that route. The
-// cost is a one-time 5-20+ second live resolution the first time a specific
-// recording is played after its cache has gone stale - rare for a low-
-// traffic phone line, and worth it to keep total requests to that route low.
+// admin-provided direct link. It's kept warm by pollKickVideos, both at
+// archive time and via warmStalestVodUrl's gentle one-at-a-time background
+// refresh - a caller pressing play should almost always hit a cache that's
+// already fresh, since a resolution failing (e.g. a Cloudflare block) right
+// when someone's actually trying to listen is the worst time for it to
+// happen. resolveRecordingAudioUrl below is still the on-demand fallback for
+// whatever the background pass hasn't gotten to yet.
 const vodUrlCache = new Map();
 
 async function resolveRecordingAudioUrl(recording) {
