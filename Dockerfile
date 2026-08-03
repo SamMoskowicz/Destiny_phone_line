@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Chromium (via Puppeteer) needs these system libraries to run on a minimal
 # Debian base image - none of this is present in the default Node buildpack
