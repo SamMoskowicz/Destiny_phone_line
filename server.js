@@ -20,81 +20,16 @@ const KICK_VIDEOS_POLL_INTERVAL_MS = Number(process.env.KICK_VIDEOS_POLL_INTERVA
 const KICK_VOD_URL_TTL_MS = 45 * 60 * 1000;
 const KICK_VOD_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
 
-const liveRelayClients = new Set();
-let liveRelayProcess = null;
 let liveRelayUrl = process.env.LIVE_HLS_URL || null;
 
-function startLiveRelay(hlsUrl) {
-    if (!hlsUrl || liveRelayProcess) {
-        return;
-    }
-
-    const proc = spawn(FFMPEG_PATH, [
-        '-re',
-        '-i', hlsUrl,
-        '-vn',
-        '-c:a', 'libmp3lame',
-        '-b:a', '96k',
-        '-ar', '44100',
-        '-f', 'mp3',
-        '-'
-    ], { stdio: ['ignore', 'pipe', 'inherit'] });
-    liveRelayProcess = proc;
-
-    proc.on('error', (error) => {
-        console.error('live relay ffmpeg error:', error);
-    });
-
-    // Guarded with `liveRelayProcess === proc` because kill() is async: if this
-    // process was already replaced by stopLiveRelay()+startLiveRelay(), its
-    // delayed exit must not null out the newer process or drop its listeners.
-    proc.on('exit', (code, signal) => {
-        console.error(`live relay ffmpeg exited with code=${code} signal=${signal}`);
-        if (liveRelayProcess === proc) {
-            for (const res of liveRelayClients) {
-                if (!res.writableEnded) {
-                    res.end();
-                }
-            }
-            liveRelayClients.clear();
-            liveRelayProcess = null;
-        }
-    });
-
-    proc.stdout.on('data', (chunk) => {
-        if (liveRelayProcess !== proc) {
-            return;
-        }
-        for (const res of liveRelayClients) {
-            const ok = res.write(chunk);
-            if (!ok) {
-                // backpressure is handled by Node streams
-            }
-        }
-    });
-
-    proc.stdout.on('end', () => {
-        if (liveRelayProcess === proc) {
-            for (const res of liveRelayClients) {
-                res.end();
-            }
-            liveRelayClients.clear();
-        }
-    });
-}
-
-function stopLiveRelay() {
-    if (liveRelayProcess) {
-        liveRelayProcess.kill('SIGKILL');
-        liveRelayProcess = null;
-    }
-    for (const res of liveRelayClients) {
-        if (!res.writableEnded) {
-            res.end();
-        }
-    }
-    liveRelayClients.clear();
-}
+// Twilio's <Play> fetches a URL expecting a finite, completable download -
+// an endlessly open stream eventually hits Twilio's own fetch timeout
+// (confirmed via Twilio error 11200 / "AsyncContext timeout" at ~30s), no
+// matter how healthy the audio pipe is server-side. So /live.mp3 doesn't
+// keep one persistent shared process running - each request gets its own
+// short, complete chunk, and the TwiML loops back to fetch the next one.
+const LIVE_CHUNK_SECONDS = 18;
+const activeLiveRequests = new Set();
 
 function getRequestBaseUrl(req = null) {
     const configured = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
@@ -123,22 +58,13 @@ function buildRecordingPlaybackUrl(req, recordingId, startSeconds) {
     return `${baseUrl}/recordings/${encodeURIComponent(recordingId)}/play?start=${start}`;
 }
 
-function ensureLiveRelay() {
-    if (!liveRelayUrl) {
-        return;
-    }
-    if (!liveRelayProcess) {
-        startLiveRelay(liveRelayUrl);
-    }
-}
-
 async function pollKickChannel() {
     // Runs every 90s forever, so unlike the archiving polls this one can't
     // just be delayed until nobody's listening - it would starve a long call
     // repeatedly. Skipping it while someone's live means we won't notice the
-    // stream ending mid-call, but ffmpeg will exit on its own once the source
-    // actually goes away, which the existing exit handler already covers.
-    if (liveRelayClients.size > 0) {
+    // stream ending mid-call, but the next chunk request will naturally 503
+    // once liveRelayUrl clears, which the /voice/live-continue loop handles.
+    if (activeLiveRequests.size > 0) {
         return;
     }
     try {
@@ -146,13 +72,9 @@ async function pollKickChannel() {
 
         if (isLive && hlsUrl) {
             // Only start a fresh "recording" on an offline->live transition. A
-            // mid-broadcast URL refresh (Kick can rotate the token) should just
-            // restart the relay, not spam the 5-slot archive list with duplicates.
-            if (liveRelayUrl !== hlsUrl) {
-                liveRelayUrl = hlsUrl;
-                stopLiveRelay();
-                ensureLiveRelay();
-            }
+            // mid-broadcast URL refresh (Kick can rotate the token) just updates
+            // the source the next chunk request will use.
+            liveRelayUrl = hlsUrl;
             if (!service.state.isLive) {
                 service.startStream({ audioUrl: buildLivePlaybackUrl(), sourceUrl: liveRelayUrl });
             }
@@ -162,7 +84,6 @@ async function pollKickChannel() {
             console.warn('Kick reports live but no playback_url was returned; leaving current state as-is.');
         } else if (!isLive && service.state.isLive) {
             service.endStream();
-            stopLiveRelay();
             liveRelayUrl = null;
         }
     } catch (error) {
@@ -183,7 +104,7 @@ async function pollKickVideos() {
     // Chrome (Puppeteer) and ffmpeg competing for the same CPU core can stall
     // audio delivery to an actively-listening caller badly enough that Twilio
     // gives up on the stream - defer background archiving until nobody's live.
-    if (liveRelayClients.size > 0) {
+    if (activeLiveRequests.size > 0) {
         return;
     }
     try {
@@ -192,7 +113,7 @@ async function pollKickVideos() {
             // Re-checked per video (not just once at the top) - archiving all
             // 5 can take minutes, and a caller can connect to the live stream
             // partway through an already-running poll.
-            if (liveRelayClients.size > 0) {
+            if (activeLiveRequests.size > 0) {
                 console.log('Pausing Kick video archiving: a caller is listening live');
                 return;
             }
@@ -231,7 +152,7 @@ async function pollKickVideos() {
 const vodUrlCache = new Map();
 
 async function refreshVodCache() {
-    if (liveRelayClients.size > 0) {
+    if (activeLiveRequests.size > 0) {
         return;
     }
     const kickRecordings = service.state.recordings.filter((entry) => entry.kickVideoId && !entry.live);
@@ -313,6 +234,15 @@ function handleVoiceRequest(req, res, body) {
     const phoneNumber = body.From || body.phoneNumber || 'unknown-caller';
     const digits = body.Digits || body.digits || '';
 
+    if (req.url === '/voice/live-continue') {
+        // Reached when one live chunk finishes and the caller didn't press
+        // anything - loop back for the next chunk. Silent (message is null)
+        // while still live; gracefully falls back to the menu once it ends.
+        const liveResult = service.selectLiveStream(phoneNumber);
+        sendTwiml(res, service.buildLiveStreamTwiML(liveResult.message, liveResult.audioUrl));
+        return;
+    }
+
     if (req.url === '/voice/playback') {
         const action = service.handlePlaybackControl(phoneNumber, digits);
 
@@ -327,7 +257,6 @@ function handleVoiceRequest(req, res, body) {
         }
 
         if (action.type === 'live-resume') {
-            ensureLiveRelay();
             sendTwiml(res, service.buildLiveStreamTwiML(null, buildLivePlaybackUrl(req)));
             return;
         }
@@ -340,9 +269,6 @@ function handleVoiceRequest(req, res, body) {
     if (digits) {
         if (digits === '1') {
             const liveResult = service.selectLiveStream(phoneNumber);
-            if (liveResult.audioUrl) {
-                ensureLiveRelay();
-            }
             sendTwiml(res, service.buildLiveStreamTwiML(liveResult.message, liveResult.audioUrl));
             return;
         }
@@ -514,7 +440,6 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        ensureLiveRelay();
         res.writeHead(200, {
             'Content-Type': 'audio/mpeg',
             'Connection': 'close',
@@ -527,9 +452,36 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        liveRelayClients.add(res);
+        // A bounded chunk, not an infinite pipe - see the LIVE_CHUNK_SECONDS
+        // comment above for why. -re paces the read to real-time so the
+        // response trickles out over ~LIVE_CHUNK_SECONDS instead of bursting.
+        const proc = spawn(FFMPEG_PATH, [
+            '-re',
+            '-i', liveRelayUrl,
+            '-t', String(LIVE_CHUNK_SECONDS),
+            '-vn',
+            '-c:a', 'libmp3lame',
+            '-b:a', '96k',
+            '-ar', '44100',
+            '-f', 'mp3',
+            '-'
+        ], { stdio: ['ignore', 'pipe', 'inherit'] });
+
+        activeLiveRequests.add(proc);
+        proc.on('exit', () => {
+            activeLiveRequests.delete(proc);
+        });
+        proc.on('error', (error) => {
+            console.error('live chunk relay error:', error);
+            if (!res.writableEnded) {
+                res.end();
+            }
+        });
+
+        proc.stdout.pipe(res);
+
         req.on('close', () => {
-            liveRelayClients.delete(res);
+            proc.kill('SIGKILL');
         });
         return;
     }
@@ -620,6 +572,12 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    if (req.method === 'POST' && req.url === '/voice/live-continue') {
+        const body = await parseBody(req);
+        handleVoiceRequest(req, res, body);
+        return;
+    }
+
     if (req.method === 'POST' && req.url === '/admin/stream/live') {
         if (!isAuthorizedAdmin(req)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -629,8 +587,6 @@ const server = http.createServer(async (req, res) => {
 
         const body = await parseBody(req);
         liveRelayUrl = body.audioUrl || liveRelayUrl;
-        stopLiveRelay();
-        ensureLiveRelay();
 
         const recording = service.startStream({ audioUrl: buildLivePlaybackUrl(req), sourceUrl: liveRelayUrl });
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -646,7 +602,6 @@ const server = http.createServer(async (req, res) => {
         }
 
         const result = service.endStream();
-        stopLiveRelay();
         liveRelayUrl = null;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, ...result }));
@@ -696,7 +651,9 @@ server.listen(port, () => {
 });
 
 async function shutdown() {
-    stopLiveRelay();
+    for (const proc of activeLiveRequests) {
+        proc.kill('SIGKILL');
+    }
     await kickBrowser.shutdown();
     server.close(() => process.exit(0));
 }

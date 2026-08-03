@@ -80,7 +80,11 @@ class PhoneService {
 
     buildLiveStreamTwiML(prompt, audioUrl = null) {
         if (audioUrl) {
-            return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="30" finishOnKey="">\n    <Play>${audioUrl}</Play>\n  </Gather>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
+            // /live.mp3 hands back one bounded chunk at a time (Twilio's <Play>
+            // can't fetch a truly endless stream - see server.js). A short
+            // post-chunk timeout means the /voice/live-continue loop kicks in
+            // quickly instead of sitting on dead air waiting for a keypress.
+            return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="2" finishOnKey="">\n    <Play>${audioUrl}</Play>\n  </Gather>\n  <Redirect>/voice/live-continue</Redirect>\n</Response>`;
         }
         return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${prompt}</Say>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
     }
