@@ -388,18 +388,29 @@ const server = http.createServer(async (req, res) => {
         }
         const resolveMs = Date.now() - startedAt;
 
+        // Exactly the same args /recordings/:id/play uses in production
+        // (including -ss and real mp3 encoding, not a discarded null output),
+        // so any failure here reproduces the real bug, not a simplified version of it.
         const ffmpegStartedAt = Date.now();
         const proc = spawn(FFMPEG_PATH, [
             '-loglevel', 'verbose',
+            '-ss', '0',
             '-i', audioUrl,
-            '-t', '3',
-            '-f', 'null',
+            '-vn',
+            '-c:a', 'libmp3lame',
+            '-b:a', '96k',
+            '-ar', '44100',
+            '-f', 'mp3',
             '-'
-        ], { stdio: ['ignore', 'ignore', 'pipe'] });
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
         let stderr = '';
+        let stdoutBytes = 0;
         proc.stderr.on('data', (chunk) => {
             stderr += chunk.toString();
+        });
+        proc.stdout.on('data', (chunk) => {
+            stdoutBytes += chunk.length;
         });
 
         const result = await new Promise((resolve) => {
@@ -417,6 +428,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({
             ok: true,
             recordingTitle: recording.title,
+            stdoutBytes,
             resolveMs,
             ffmpegMs: Date.now() - ffmpegStartedAt,
             ffmpegExitCode: result.code ?? null,
@@ -498,7 +510,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (req.method === 'GET' && req.url.startsWith('/recordings/')) {
+    if ((req.method === 'GET' || req.method === 'HEAD') && req.url.startsWith('/recordings/')) {
         const match = req.url.match(/^\/recordings\/([^/?]+)\/play(?:\?(.*))?$/);
         const recordingId = match ? decodeURIComponent(match[1]) : null;
         const recording = recordingId
@@ -530,6 +542,11 @@ const server = http.createServer(async (req, res) => {
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache'
         });
+
+        if (req.method === 'HEAD') {
+            res.end();
+            return;
+        }
 
         // Seeking into a static recording is a one-off per-caller ffmpeg process
         // (unlike the fan-out live relay) since each caller can be at a different
