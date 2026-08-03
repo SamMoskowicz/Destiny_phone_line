@@ -15,6 +15,18 @@ function generateId() {
     return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+// TwiML is XML - any dynamic value dropped into <Say> text or a <Play> URL
+// (recording titles from Kick, query strings with & in them, etc.) has to be
+// escaped or a bare & or < makes the whole document invalid (Twilio error
+// 12100 "Document parse failure", which surfaces to the caller as an
+// immediate "application error" with no audio at all).
+function escapeXml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 class PhoneService {
     constructor({ streamerName = 'Destiny', storageFile } = {}) {
         this.streamerName = streamerName || 'Destiny';
@@ -60,21 +72,22 @@ class PhoneService {
     }
 
     buildMenuTwiML(customPrompt = null) {
-        const menuPrompt = this.getMenuPrompt();
+        const menuPrompt = escapeXml(this.getMenuPrompt());
         // A status/error message (e.g. "that recording is not available") gets
         // said first, then a beat of silence, then the actual menu - otherwise
         // it runs into the menu as one monotonous sentence.
-        const intro = customPrompt ? `\n  <Say voice="alice">${customPrompt}</Say>\n  <Pause length="1"/>` : '';
+        const intro = customPrompt ? `\n  <Say voice="alice">${escapeXml(customPrompt)}</Say>\n  <Pause length="1"/>` : '';
         return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${intro}\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${menuPrompt}</Say>\n  </Gather>\n  <Say voice="alice">${menuPrompt}</Say>\n</Response>`;
     }
 
     buildControlsInfoTwiML() {
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${this.getControlsInfoPrompt()}</Say>\n  <Pause length="1"/>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${this.getMenuPrompt()}</Say>\n  </Gather>\n  <Say voice="alice">${this.getMenuPrompt()}</Say>\n</Response>`;
+        const menuPrompt = escapeXml(this.getMenuPrompt());
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${escapeXml(this.getControlsInfoPrompt())}</Say>\n  <Pause length="1"/>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${menuPrompt}</Say>\n  </Gather>\n  <Say voice="alice">${menuPrompt}</Say>\n</Response>`;
     }
 
     buildPlaybackTwiML(prompt, audioUrl = null) {
-        const say = prompt ? `\n    <Say voice="alice">${prompt}</Say>` : '';
-        const audioSection = audioUrl ? `\n    <Play>${audioUrl}</Play>` : '';
+        const say = prompt ? `\n    <Say voice="alice">${escapeXml(prompt)}</Say>` : '';
+        const audioSection = audioUrl ? `\n    <Play>${escapeXml(audioUrl)}</Play>` : '';
         // Redirects to /voice/playback itself (not /voice/menu): a chunk ending
         // with no keypress posts empty Digits there, which handlePlaybackControl's
         // default path treats as "continue from the current position" - that's
@@ -84,7 +97,7 @@ class PhoneService {
     }
 
     buildPausedTwiML(message) {
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="120" finishOnKey="">\n    <Say voice="alice">${message}</Say>\n  </Gather>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="120" finishOnKey="">\n    <Say voice="alice">${escapeXml(message)}</Say>\n  </Gather>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
     }
 
     buildLiveStreamTwiML(prompt, audioUrl = null) {
@@ -94,9 +107,9 @@ class PhoneService {
             // (the minimum Twilio allows) keeps the post-chunk dead air before
             // the /voice/live-continue loop fires as short as possible, while
             // still leaving a beat to catch a keypress right at the boundary.
-            return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="1" finishOnKey="">\n    <Play>${audioUrl}</Play>\n  </Gather>\n  <Redirect>/voice/live-continue</Redirect>\n</Response>`;
+            return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="1" finishOnKey="">\n    <Play>${escapeXml(audioUrl)}</Play>\n  </Gather>\n  <Redirect>/voice/live-continue</Redirect>\n</Response>`;
         }
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${prompt}</Say>\n  <Pause length="1"/>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${escapeXml(prompt)}</Say>\n  <Pause length="1"/>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
     }
 
     ensureCaller(phoneNumber) {
