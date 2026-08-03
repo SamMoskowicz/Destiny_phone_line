@@ -361,6 +361,67 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Runs the exact same resolve-then-ffmpeg-fetch path a real call uses,
+    // but outside of Twilio - so nothing kills ffmpeg early and we can see
+    // its full output (or lack thereof) to tell apart "too slow" from
+    // "can't reach the URL at all" from Render's network.
+    if (req.url === '/diagnostics/vod-fetch') {
+        const recording = service.state.recordings.find((entry) => entry.kickVideoId && !entry.live);
+        if (!recording) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'No archived Kick recording available to test with' }));
+            return;
+        }
+
+        const startedAt = Date.now();
+        let audioUrl;
+        try {
+            audioUrl = await resolveRecordingAudioUrl(recording);
+        } catch (error) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, stage: 'resolve', error: error.message, resolveMs: Date.now() - startedAt }));
+            return;
+        }
+        const resolveMs = Date.now() - startedAt;
+
+        const ffmpegStartedAt = Date.now();
+        const proc = spawn(ffmpegInstaller.path, [
+            '-loglevel', 'verbose',
+            '-i', audioUrl,
+            '-t', '3',
+            '-f', 'null',
+            '-'
+        ], { stdio: ['ignore', 'ignore', 'pipe'] });
+
+        let stderr = '';
+        proc.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+
+        const result = await new Promise((resolve) => {
+            const hardTimeout = setTimeout(() => {
+                proc.kill('SIGKILL');
+                resolve({ timedOut: true });
+            }, 25000);
+            proc.on('exit', (code) => {
+                clearTimeout(hardTimeout);
+                resolve({ code });
+            });
+        });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: true,
+            recordingTitle: recording.title,
+            resolveMs,
+            ffmpegMs: Date.now() - ffmpegStartedAt,
+            ffmpegExitCode: result.code ?? null,
+            ffmpegTimedOut: Boolean(result.timedOut),
+            stderrTail: stderr.slice(-2500)
+        }));
+        return;
+    }
+
     // Shows the current archive list (metadata only, no playback URLs) so we
     // can tell whether pollKickVideos has actually populated anything without
     // needing a real phone call to find out.
