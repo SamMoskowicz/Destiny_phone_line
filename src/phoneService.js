@@ -75,7 +75,12 @@ class PhoneService {
     buildPlaybackTwiML(prompt, audioUrl = null) {
         const say = prompt ? `\n    <Say voice="alice">${prompt}</Say>` : '';
         const audioSection = audioUrl ? `\n    <Play>${audioUrl}</Play>` : '';
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="30" finishOnKey="">${say}${audioSection}\n  </Gather>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
+        // Redirects to /voice/playback itself (not /voice/menu): a chunk ending
+        // with no keypress posts empty Digits there, which handlePlaybackControl's
+        // default path treats as "continue from the current position" - that's
+        // what makes an archived recording keep playing across chunk boundaries
+        // instead of dropping to the menu every ~18 seconds.
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="2" finishOnKey="">${say}${audioSection}\n  </Gather>\n  <Redirect>/voice/playback</Redirect>\n</Response>`;
     }
 
     buildPausedTwiML(message) {
@@ -274,13 +279,13 @@ class PhoneService {
             : null;
 
         if (!recording) {
-            return { type: 'menu', message: this.getMenuPrompt() };
+            return { type: 'menu' };
         }
 
         if (digit === '8') {
             this.pauseSegment(caller);
             this.saveState();
-            return { type: 'menu', message: this.getMenuPrompt() };
+            return { type: 'menu' };
         }
 
         if (digit === '2') {
@@ -314,6 +319,17 @@ class PhoneService {
 
         const currentPosition = this.getElapsedPosition(caller);
         const nextPosition = Math.max(0, currentPosition + (deltaSeconds || 0));
+
+        // Each <Play> only covers a bounded chunk (see ARCHIVE_CHUNK_SECONDS in
+        // server.js), so a natural chunk-end (digit === '') keeps calling this
+        // with a same-position "continue" - without this check, a finished
+        // recording would loop forever requesting past its own end.
+        if (recording.durationSeconds && nextPosition >= recording.durationSeconds) {
+            this.pauseSegment(caller);
+            this.saveState();
+            return { type: 'menu', message: `Finished playing ${recording.title}.` };
+        }
+
         this.startSegment(caller, recording.id, nextPosition);
         this.saveState();
         return { type: 'seek', recordingId: recording.id, positionSeconds: nextPosition };

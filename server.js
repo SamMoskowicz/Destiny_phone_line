@@ -22,14 +22,95 @@ const KICK_VOD_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
 
 let liveRelayUrl = process.env.LIVE_HLS_URL || null;
 
-// Twilio's <Play> fetches a URL expecting a finite, completable download -
-// an endlessly open stream eventually hits Twilio's own fetch timeout
-// (confirmed via Twilio error 11200 / "AsyncContext timeout" at ~30s), no
-// matter how healthy the audio pipe is server-side. So /live.mp3 doesn't
-// keep one persistent shared process running - each request gets its own
-// short, complete chunk, and the TwiML loops back to fetch the next one.
+// Twilio's <Play> fetches a URL expecting a finite, completable download - an
+// endlessly open stream eventually hits Twilio's own fetch timeout (confirmed
+// via Twilio error 11200 / "AsyncContext timeout" at ~30s). So /live.mp3 never
+// hands Twilio an unbounded response - each request auto-closes after
+// LIVE_CHUNK_SECONDS, and the TwiML loops back for the next one. What it does
+// NOT do is re-establish the connection to Kick per chunk: that reconnect
+// (DNS + TLS + manifest + first segment) was the dominant cause of an audible
+// ~10s gap between chunks. Instead one transcode process stays connected in
+// the background for as long as the stream is live, feeding a small catch-up
+// buffer that each new chunk request replays instantly before tailing live data.
 const LIVE_CHUNK_SECONDS = 18;
+const LIVE_CATCHUP_BUFFER_MS = 5000;
 const activeLiveRequests = new Set();
+let liveTranscodeProcess = null;
+let liveTranscodeBuffer = [];
+
+function startLiveTranscode(hlsUrl) {
+    if (!hlsUrl || liveTranscodeProcess) {
+        return;
+    }
+
+    const proc = spawn(FFMPEG_PATH, [
+        '-re',
+        '-i', hlsUrl,
+        '-vn',
+        '-c:a', 'libmp3lame',
+        '-b:a', '96k',
+        '-ar', '44100',
+        '-f', 'mp3',
+        '-'
+    ], { stdio: ['ignore', 'pipe', 'inherit'] });
+    liveTranscodeProcess = proc;
+
+    proc.on('error', (error) => {
+        console.error('live transcode error:', error);
+    });
+
+    // Guarded with `liveTranscodeProcess === proc` because kill() is async: if
+    // this process was already replaced by stopLiveTranscode()+startLiveTranscode(),
+    // its delayed exit must not null out the newer process.
+    proc.on('exit', (code, signal) => {
+        console.error(`live transcode exited with code=${code} signal=${signal}`);
+        if (liveTranscodeProcess === proc) {
+            liveTranscodeProcess = null;
+            liveTranscodeBuffer = [];
+            for (const res of activeLiveRequests) {
+                if (!res.writableEnded) {
+                    res.end();
+                }
+            }
+        }
+    });
+
+    proc.stdout.on('data', (chunk) => {
+        if (liveTranscodeProcess !== proc) {
+            return;
+        }
+        const now = Date.now();
+        liveTranscodeBuffer.push({ chunk, at: now });
+        while (liveTranscodeBuffer.length && now - liveTranscodeBuffer[0].at > LIVE_CATCHUP_BUFFER_MS) {
+            liveTranscodeBuffer.shift();
+        }
+        for (const res of activeLiveRequests) {
+            res.write(chunk);
+        }
+    });
+}
+
+function stopLiveTranscode() {
+    if (liveTranscodeProcess) {
+        liveTranscodeProcess.kill('SIGKILL');
+        liveTranscodeProcess = null;
+    }
+    liveTranscodeBuffer = [];
+    for (const res of activeLiveRequests) {
+        if (!res.writableEnded) {
+            res.end();
+        }
+    }
+    activeLiveRequests.clear();
+}
+
+// Same reasoning applies to archived recordings: without a bound, ffmpeg
+// would try to stream from the seek position all the way to the end of a
+// potentially multi-hour VOD in one response, which Twilio can't wait out
+// any better than an infinite live stream. Archives don't get the persistent-
+// connection treatment live does, since each caller can be at a different
+// seek position - there's no single shared stream to keep warm.
+const ARCHIVE_CHUNK_SECONDS = 18;
 
 function getRequestBaseUrl(req = null) {
     const configured = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
@@ -62,8 +143,8 @@ async function pollKickChannel() {
     // Runs every 90s forever, so unlike the archiving polls this one can't
     // just be delayed until nobody's listening - it would starve a long call
     // repeatedly. Skipping it while someone's live means we won't notice the
-    // stream ending mid-call, but the next chunk request will naturally 503
-    // once liveRelayUrl clears, which the /voice/live-continue loop handles.
+    // stream ending mid-call, but the transcode process will exit on its own
+    // once the source actually goes away, which its exit handler covers.
     if (activeLiveRequests.size > 0) {
         return;
     }
@@ -72,9 +153,13 @@ async function pollKickChannel() {
 
         if (isLive && hlsUrl) {
             // Only start a fresh "recording" on an offline->live transition. A
-            // mid-broadcast URL refresh (Kick can rotate the token) just updates
-            // the source the next chunk request will use.
-            liveRelayUrl = hlsUrl;
+            // mid-broadcast URL refresh (Kick can rotate the token) restarts the
+            // transcode against the new URL.
+            if (liveRelayUrl !== hlsUrl) {
+                liveRelayUrl = hlsUrl;
+                stopLiveTranscode();
+                startLiveTranscode(liveRelayUrl);
+            }
             if (!service.state.isLive) {
                 service.startStream({ audioUrl: buildLivePlaybackUrl(), sourceUrl: liveRelayUrl });
             }
@@ -84,6 +169,7 @@ async function pollKickChannel() {
             console.warn('Kick reports live but no playback_url was returned; leaving current state as-is.');
         } else if (!isLive && service.state.isLive) {
             service.endStream();
+            stopLiveTranscode();
             liveRelayUrl = null;
         }
     } catch (error) {
@@ -247,7 +333,7 @@ function handleVoiceRequest(req, res, body) {
         const action = service.handlePlaybackControl(phoneNumber, digits);
 
         if (action.type === 'menu') {
-            sendTwiml(res, service.buildMenuTwiML());
+            sendTwiml(res, service.buildMenuTwiML(action.message));
             return;
         }
 
@@ -452,36 +538,30 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        // A bounded chunk, not an infinite pipe - see the LIVE_CHUNK_SECONDS
-        // comment above for why. -re paces the read to real-time so the
-        // response trickles out over ~LIVE_CHUNK_SECONDS instead of bursting.
-        const proc = spawn(FFMPEG_PATH, [
-            '-re',
-            '-i', liveRelayUrl,
-            '-t', String(LIVE_CHUNK_SECONDS),
-            '-vn',
-            '-c:a', 'libmp3lame',
-            '-b:a', '96k',
-            '-ar', '44100',
-            '-f', 'mp3',
-            '-'
-        ], { stdio: ['ignore', 'pipe', 'inherit'] });
+        startLiveTranscode(liveRelayUrl);
 
-        activeLiveRequests.add(proc);
-        proc.on('exit', () => {
-            activeLiveRequests.delete(proc);
-        });
-        proc.on('error', (error) => {
-            console.error('live chunk relay error:', error);
+        // Replay the catch-up buffer so this request produces audio
+        // immediately instead of waiting on the next data event from the
+        // (already-connected, persistent) transcode process.
+        for (const { chunk } of liveTranscodeBuffer) {
+            res.write(chunk);
+        }
+
+        activeLiveRequests.add(res);
+
+        // A bounded response, not an infinite pipe - see the LIVE_CHUNK_SECONDS
+        // comment above for why. The underlying connection to Kick stays open;
+        // only this individual caller's HTTP response closes on schedule.
+        const closeTimer = setTimeout(() => {
+            activeLiveRequests.delete(res);
             if (!res.writableEnded) {
                 res.end();
             }
-        });
-
-        proc.stdout.pipe(res);
+        }, LIVE_CHUNK_SECONDS * 1000);
 
         req.on('close', () => {
-            proc.kill('SIGKILL');
+            clearTimeout(closeTimer);
+            activeLiveRequests.delete(res);
         });
         return;
     }
@@ -526,10 +606,14 @@ const server = http.createServer(async (req, res) => {
 
         // Seeking into a static recording is a one-off per-caller ffmpeg process
         // (unlike the fan-out live relay) since each caller can be at a different
-        // position - -ss before -i does an efficient input-side seek.
+        // position - -ss before -i does an efficient input-side seek. Bounded to
+        // ARCHIVE_CHUNK_SECONDS for the same reason live is chunked; the TwiML
+        // auto-continues from wherever this chunk leaves off (see
+        // handlePlaybackControl's default digit path).
         const proc = spawn(FFMPEG_PATH, [
             '-ss', String(start),
             '-i', audioUrl,
+            '-t', String(ARCHIVE_CHUNK_SECONDS),
             '-vn',
             '-c:a', 'libmp3lame',
             '-b:a', '96k',
@@ -587,6 +671,8 @@ const server = http.createServer(async (req, res) => {
 
         const body = await parseBody(req);
         liveRelayUrl = body.audioUrl || liveRelayUrl;
+        stopLiveTranscode();
+        startLiveTranscode(liveRelayUrl);
 
         const recording = service.startStream({ audioUrl: buildLivePlaybackUrl(req), sourceUrl: liveRelayUrl });
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -602,6 +688,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         const result = service.endStream();
+        stopLiveTranscode();
         liveRelayUrl = null;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, ...result }));
@@ -651,9 +738,7 @@ server.listen(port, () => {
 });
 
 async function shutdown() {
-    for (const proc of activeLiveRequests) {
-        proc.kill('SIGKILL');
-    }
+    stopLiveTranscode();
     await kickBrowser.shutdown();
     server.close(() => process.exit(0));
 }
