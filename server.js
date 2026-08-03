@@ -181,6 +181,13 @@ async function pollKickVideos() {
     try {
         const videoIds = await kickBrowser.listRecentVideoIds(KICK_CHANNEL, 5);
         for (const videoId of videoIds) {
+            // Re-checked per video (not just once at the top) - archiving all
+            // 5 can take minutes, and a caller can connect to the live stream
+            // partway through an already-running poll.
+            if (liveRelayClients.size > 0) {
+                console.log('Pausing Kick video archiving: a caller is listening live');
+                return;
+            }
             if (archivedKickVideoIds.has(videoId)) {
                 continue;
             }
