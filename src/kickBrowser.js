@@ -49,9 +49,26 @@ async function withPage(fn) {
     }
 }
 
+// Some kick.com routes (confirmed on individual video pages) serve a
+// Cloudflare "Just a moment..." bot-verification interstitial instead of the
+// real page. For a real browser this normally clears itself within a few
+// seconds - a background JS check, then an automatic redirect - so it's
+// worth waiting out rather than treating the interstitial as the real page.
+async function waitOutCloudflareChallenge(page, timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const title = await page.title().catch(() => '');
+        if (!/just a moment/i.test(title)) {
+            return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+}
+
 async function checkLiveStatus(slug) {
     return withPage(async (page) => {
         await page.goto(`https://kick.com/${slug}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await waitOutCloudflareChallenge(page);
         const result = await page.evaluate(async (channelSlug) => {
             const res = await fetch(`https://kick.com/api/v1/channels/${channelSlug}`, {
                 headers: { Accept: 'application/json' }
@@ -72,6 +89,7 @@ async function checkLiveStatus(slug) {
 async function listRecentVideoIds(slug, limit = 5) {
     return withPage(async (page) => {
         await page.goto(`https://kick.com/${slug}/videos`, { waitUntil: 'networkidle2', timeout: 30000 });
+        await waitOutCloudflareChallenge(page);
         const ids = await page.evaluate(() => {
             const anchors = Array.from(document.querySelectorAll('a[href*="/videos/"]'));
             const seen = new Set();
@@ -112,6 +130,7 @@ async function getVodPlaybackInfo(slug, videoId) {
         });
 
         await page.goto(`https://kick.com/${slug}/videos/${videoId}`, { waitUntil: 'networkidle2', timeout: 30000 });
+        await waitOutCloudflareChallenge(page);
         await new Promise((resolve) => setTimeout(resolve, 1500));
 
         const videoHandle = await page.$('video');
