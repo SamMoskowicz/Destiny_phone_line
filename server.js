@@ -108,6 +108,12 @@ function buildLivePlaybackUrl(req = null) {
     return `${baseUrl}/live.mp3`;
 }
 
+function buildRecordingPlaybackUrl(req, recordingId, startSeconds) {
+    const baseUrl = getRequestBaseUrl(req) || `http://localhost:${process.env.PORT || 3000}`;
+    const start = Math.max(0, Math.floor(startSeconds || 0));
+    return `${baseUrl}/recordings/${encodeURIComponent(recordingId)}/play?start=${start}`;
+}
+
 function ensureLiveRelay() {
     if (!liveRelayUrl) {
         return;
@@ -222,19 +228,35 @@ function handleVoiceRequest(req, res, body) {
     const digits = body.Digits || body.digits || '';
 
     if (req.url === '/voice/playback') {
-        const action = service.handlePlaybackControl(phoneNumber, digits, body.recordingId || null);
+        const action = service.handlePlaybackControl(phoneNumber, digits);
+
         if (action.type === 'menu') {
             sendTwiml(res, service.buildMenuTwiML());
             return;
         }
 
-        sendTwiml(res, service.buildPlaybackTwiML(action.message));
+        if (action.type === 'paused') {
+            sendTwiml(res, service.buildPausedTwiML(action.message));
+            return;
+        }
+
+        if (action.type === 'live-resume') {
+            ensureLiveRelay();
+            sendTwiml(res, service.buildLiveStreamTwiML(null, buildLivePlaybackUrl(req)));
+            return;
+        }
+
+        const playUrl = buildRecordingPlaybackUrl(req, action.recordingId, action.positionSeconds);
+        sendTwiml(res, service.buildPlaybackTwiML(null, playUrl));
         return;
     }
 
     if (digits) {
         if (digits === '1') {
             const liveResult = service.selectLiveStream(phoneNumber);
+            if (liveResult.audioUrl) {
+                ensureLiveRelay();
+            }
             sendTwiml(res, service.buildLiveStreamTwiML(liveResult.message, liveResult.audioUrl));
             return;
         }
@@ -245,7 +267,8 @@ function handleVoiceRequest(req, res, body) {
                 sendTwiml(res, service.buildMenuTwiML(recordingResult.message));
                 return;
             }
-            sendTwiml(res, service.buildPlaybackTwiML(recordingResult.message, recordingResult.audioUrl));
+            const playUrl = buildRecordingPlaybackUrl(req, recordingResult.recordingId, recordingResult.positionSeconds);
+            sendTwiml(res, service.buildPlaybackTwiML(recordingResult.message, playUrl));
             return;
         }
 
@@ -262,6 +285,27 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, streamer: service.streamerName, streamerHandle: 'Destiny' }));
+        return;
+    }
+
+    // Temporary: reports whether Kick's API is reachable from this deployment's
+    // network, without leaking anything sensitive. Safe to remove once we know.
+    if (req.url === '/diagnostics/kick') {
+        const slug = KICK_CHANNEL || 'destiny';
+        try {
+            const response = await fetch(`https://kick.com/api/v1/channels/${encodeURIComponent(slug)}`, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+                    'Accept': 'application/json'
+                }
+            });
+            const bodyText = await response.text();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, kickStatus: response.status, bodyPreview: bodyText.slice(0, 300) }));
+        } catch (error) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: error.message }));
+        }
         return;
     }
 
@@ -289,6 +333,59 @@ const server = http.createServer(async (req, res) => {
         req.on('close', () => {
             liveRelayClients.delete(res);
         });
+        return;
+    }
+
+    if (req.method === 'GET' && req.url.startsWith('/recordings/')) {
+        const match = req.url.match(/^\/recordings\/([^/?]+)\/play(?:\?(.*))?$/);
+        const recordingId = match ? decodeURIComponent(match[1]) : null;
+        const recording = recordingId
+            ? service.state.recordings.find((entry) => entry.id === recordingId && !entry.live)
+            : null;
+
+        if (!recording || !recording.audioUrl) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Recording not available' }));
+            return;
+        }
+
+        const query = new URLSearchParams(match[2] || '');
+        const start = Math.max(0, Number(query.get('start')) || 0);
+
+        res.writeHead(200, {
+            'Content-Type': 'audio/mpeg',
+            'Connection': 'close',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        });
+
+        // Seeking into a static recording is a one-off per-caller ffmpeg process
+        // (unlike the fan-out live relay) since each caller can be at a different
+        // position - -ss before -i does an efficient input-side seek.
+        const proc = spawn(ffmpegInstaller.path, [
+            '-ss', String(start),
+            '-i', recording.audioUrl,
+            '-vn',
+            '-c:a', 'libmp3lame',
+            '-b:a', '96k',
+            '-ar', '44100',
+            '-f', 'mp3',
+            '-'
+        ], { stdio: ['ignore', 'pipe', 'inherit'] });
+
+        proc.on('error', (error) => {
+            console.error('recording relay error:', error);
+            if (!res.writableEnded) {
+                res.end();
+            }
+        });
+
+        proc.stdout.pipe(res);
+
+        req.on('close', () => {
+            proc.kill('SIGKILL');
+        });
+
         return;
     }
 

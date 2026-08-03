@@ -54,16 +54,43 @@ test('keeps only five recent recordings and remembers caller progress', () => {
     fs.unlinkSync(tempFile);
 });
 
-test('playback controls expose pause resume and menu options', () => {
+test('playback controls seek, pause/resume, and return to the menu', () => {
     const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
     const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+    service.addRecording({ title: 'Test recording', audioUrl: 'https://example.com/test.mp3' });
+    service.selectRecording('+15550001111', '2');
 
-    const action = service.handlePlaybackControl('+15550001111', '3', 'recording-1');
-    assert.equal(action.type, 'skipped');
-    assert.equal(action.positionSeconds, 30);
+    const forward10 = service.handlePlaybackControl('+15550001111', '3');
+    assert.equal(forward10.type, 'seek');
+    assert.ok(forward10.positionSeconds >= 10);
 
-    const menuAction = service.handlePlaybackControl('+15550001111', '5', 'recording-1');
+    const back30min = service.handlePlaybackControl('+15550001111', '*');
+    assert.equal(back30min.type, 'seek');
+    assert.equal(back30min.positionSeconds, 0);
+
+    const paused = service.handlePlaybackControl('+15550001111', '2');
+    assert.equal(paused.type, 'paused');
+
+    const resumed = service.handlePlaybackControl('+15550001111', '2');
+    assert.equal(resumed.type, 'seek');
+
+    const menuAction = service.handlePlaybackControl('+15550001111', '8');
     assert.equal(menuAction.type, 'menu');
+
+    if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+    }
+});
+
+test('archive slots skip the currently live entry', () => {
+    const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
+    const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+    service.addRecording({ title: 'Archived stream' });
+    service.startStream({ audioUrl: 'https://example.com/live.mp3' });
+
+    const firstOption = service.getRecordingByOption('2');
+    assert.equal(firstOption.title, 'Archived stream');
+    assert.equal(firstOption.live, false);
 
     if (fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);

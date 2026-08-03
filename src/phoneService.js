@@ -54,11 +54,9 @@ class PhoneService {
     }
 
     getControlsInfoPrompt() {
-        return 'During playback: press 1 to pause, 2 to resume, 3 to skip ahead, 4 to go back, 5 for the menu, or 6 to jump to live.';
-    }
-
-    getPlaybackControlsPrompt() {
-        return '';
+        return 'During playback: press 2 to pause or play. Press 1 or 3 to go back or forward 10 seconds. '
+            + 'Press 4 or 6 to go back or forward 30 seconds. Press 7 or 9 to go back or forward 5 minutes. '
+            + 'Press star or pound to go back or forward 30 minutes. Press 8 to return to the main menu.';
     }
 
     buildMenuTwiML(customPrompt = null) {
@@ -71,17 +69,20 @@ class PhoneService {
     }
 
     buildPlaybackTwiML(prompt, audioUrl = null) {
-        const audioSection = audioUrl ? `\n  <Play>${audioUrl}</Play>` : '';
-        const controls = this.getPlaybackControlsPrompt();
-        const controlsSay = controls ? `\n    <Say voice="alice">${controls}</Say>` : '';
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="5">\n    <Say voice="alice">${prompt}</Say>${controlsSay}${audioSection}\n  </Gather>\n</Response>`;
+        const say = prompt ? `\n    <Say voice="alice">${prompt}</Say>` : '';
+        const audioSection = audioUrl ? `\n    <Play>${audioUrl}</Play>` : '';
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="30" finishOnKey="">${say}${audioSection}\n  </Gather>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
+    }
+
+    buildPausedTwiML(message) {
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="120" finishOnKey="">\n    <Say voice="alice">${message}</Say>\n  </Gather>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
     }
 
     buildLiveStreamTwiML(prompt, audioUrl = null) {
         if (audioUrl) {
-            return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Play>${audioUrl}</Play>\n</Response>`;
+            return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="30" finishOnKey="">\n    <Play>${audioUrl}</Play>\n  </Gather>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
         }
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${prompt}</Say>\n</Response>`;
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${prompt}</Say>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
     }
 
     ensureCaller(phoneNumber) {
@@ -91,11 +92,41 @@ class PhoneService {
                 lastRecordingId: null,
                 lastPositionSeconds: 0,
                 positionsByRecording: {},
-                lastVisitedAt: null
+                lastVisitedAt: null,
+                segmentStartedAt: null
             };
         }
 
         return this.state.callers[phoneNumber];
+    }
+
+    // Twilio never tells us how far into a <Play> a caller was when they hit a
+    // button, so position is inferred from wall-clock time since the current
+    // segment started. Accurate enough for 10s/30s/5min/30min granularity.
+    getElapsedPosition(caller) {
+        if (!caller.segmentStartedAt) {
+            return caller.lastPositionSeconds || 0;
+        }
+        const elapsedSeconds = (Date.now() - new Date(caller.segmentStartedAt).getTime()) / 1000;
+        return (caller.lastPositionSeconds || 0) + Math.max(0, elapsedSeconds);
+    }
+
+    startSegment(caller, recordingId, positionSeconds) {
+        const clamped = Math.max(0, positionSeconds || 0);
+        caller.lastRecordingId = recordingId;
+        caller.lastPositionSeconds = clamped;
+        caller.segmentStartedAt = new Date().toISOString();
+        caller.positionsByRecording[recordingId] = clamped;
+        caller.lastVisitedAt = caller.segmentStartedAt;
+    }
+
+    pauseSegment(caller) {
+        const position = this.getElapsedPosition(caller);
+        caller.lastPositionSeconds = position;
+        if (caller.lastRecordingId) {
+            caller.positionsByRecording[caller.lastRecordingId] = position;
+        }
+        caller.segmentStartedAt = null;
     }
 
     trimRecordings() {
@@ -147,23 +178,25 @@ class PhoneService {
     }
 
     getRecordingByOption(option) {
+        const archived = this.state.recordings.filter((entry) => !entry.live);
         const index = Number(option) - 2;
-        return this.state.recordings[index] || null;
+        return archived[index] || null;
     }
 
     selectLiveStream(phoneNumber) {
         const caller = this.ensureCaller(phoneNumber);
         const liveRecording = this.state.recordings.find((entry) => entry.id === this.state.currentLiveRecordingId);
-        caller.lastRecordingId = this.state.currentLiveRecordingId;
-        caller.lastPositionSeconds = 0;
-        caller.lastVisitedAt = new Date().toISOString();
+        const audioUrl = this.state.isLive && liveRecording ? liveRecording.audioUrl : null;
+
+        if (audioUrl) {
+            this.startSegment(caller, liveRecording.id, 0);
+        }
         this.saveState();
+
         return {
-            type: 'live',
-            recordingId: this.state.currentLiveRecordingId,
-            positionSeconds: 0,
-            audioUrl: liveRecording ? liveRecording.audioUrl : null,
-            message: this.state.isLive ? 'You are now listening to the live stream.' : 'There is no live stream currently.'
+            recordingId: audioUrl ? liveRecording.id : null,
+            audioUrl,
+            message: audioUrl ? null : 'There is no live stream currently.'
         };
     }
 
@@ -175,9 +208,7 @@ class PhoneService {
 
         const caller = this.ensureCaller(phoneNumber);
         const savedPosition = caller.positionsByRecording[recording.id] || 0;
-        caller.lastRecordingId = recording.id;
-        caller.lastPositionSeconds = savedPosition;
-        caller.lastVisitedAt = new Date().toISOString();
+        this.startSegment(caller, recording.id, savedPosition);
         this.saveState();
 
         return {
@@ -185,7 +216,6 @@ class PhoneService {
             recordingId: recording.id,
             title: recording.title,
             positionSeconds: savedPosition,
-            audioUrl: recording.audioUrl,
             message: `You are now listening to ${recording.title}.`
         };
     }
@@ -228,27 +258,56 @@ class PhoneService {
         return caller;
     }
 
-    handlePlaybackControl(phoneNumber, digit, recordingId) {
+    handlePlaybackControl(phoneNumber, digit) {
         const caller = this.ensureCaller(phoneNumber);
-        const currentPosition = caller.positionsByRecording[recordingId] || caller.lastPositionSeconds || 0;
-        const nextPosition = currentPosition;
+        const recording = caller.lastRecordingId
+            ? this.state.recordings.find((entry) => entry.id === caller.lastRecordingId)
+            : null;
 
-        switch (digit) {
-            case '1':
-                return { type: 'paused', message: 'Playback paused.' };
-            case '2':
-                return { type: 'resumed', message: 'Playback resumed.' };
-            case '3':
-                return { type: 'skipped', message: 'Skipped forward 30 seconds.', positionSeconds: nextPosition + 30 };
-            case '4':
-                return { type: 'rewound', message: 'Moved backward 30 seconds.', positionSeconds: Math.max(0, nextPosition - 30) };
-            case '5':
-                return { type: 'menu', message: this.getMenuPrompt() };
-            case '6':
-                return { type: 'live', message: 'Jumping to the live point.' };
-            default:
-                return { type: 'noop', message: 'No action taken.' };
+        if (!recording) {
+            return { type: 'menu', message: this.getMenuPrompt() };
         }
+
+        if (digit === '8') {
+            this.pauseSegment(caller);
+            this.saveState();
+            return { type: 'menu', message: this.getMenuPrompt() };
+        }
+
+        if (digit === '2') {
+            if (caller.segmentStartedAt) {
+                this.pauseSegment(caller);
+                this.saveState();
+                return { type: 'paused', message: 'Paused. Press 2 to resume.' };
+            }
+            const resumePosition = recording.live ? 0 : (caller.lastPositionSeconds || 0);
+            this.startSegment(caller, recording.id, resumePosition);
+            this.saveState();
+            return recording.live
+                ? { type: 'live-resume', recordingId: recording.id }
+                : { type: 'seek', recordingId: recording.id, positionSeconds: resumePosition };
+        }
+
+        if (recording.live) {
+            // Live can't be seeked or paused-and-resumed-from-position; any other
+            // key just keeps the caller listening to the current live point.
+            this.startSegment(caller, recording.id, 0);
+            this.saveState();
+            return { type: 'live-resume', recordingId: recording.id };
+        }
+
+        const deltaSeconds = {
+            '1': -10, '3': 10,
+            '4': -30, '6': 30,
+            '7': -300, '9': 300,
+            '*': -1800, '#': 1800
+        }[digit];
+
+        const currentPosition = this.getElapsedPosition(caller);
+        const nextPosition = Math.max(0, currentPosition + (deltaSeconds || 0));
+        this.startSegment(caller, recording.id, nextPosition);
+        this.saveState();
+        return { type: 'seek', recordingId: recording.id, positionSeconds: nextPosition };
     }
 }
 
