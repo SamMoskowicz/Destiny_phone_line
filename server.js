@@ -33,7 +33,13 @@ let liveRelayUrl = process.env.LIVE_HLS_URL || null;
 // the background for as long as the stream is live, feeding a small catch-up
 // buffer that each new chunk request replays instantly before tailing live data.
 const LIVE_CHUNK_SECONDS = 18;
-const LIVE_CATCHUP_BUFFER_MS = 5000;
+const LIVE_AUDIO_BYTES_PER_SECOND = (96 * 1000) / 8; // matches -b:a 96k below
+const LIVE_CHUNK_BYTES = LIVE_AUDIO_BYTES_PER_SECOND * LIVE_CHUNK_SECONDS;
+// Kept comfortably above LIVE_CHUNK_SECONDS worth of audio: as long as the
+// transcoder has been running for a while, a fresh request can be satisfied
+// entirely out of this buffer and close (and thus become playable to Twilio)
+// in well under a second, instead of waiting out a fixed real-time delay.
+const LIVE_CATCHUP_BUFFER_MS = (LIVE_CHUNK_SECONDS + 7) * 1000;
 const activeLiveRequests = new Set();
 let liveTranscodeProcess = null;
 let liveTranscodeBuffer = [];
@@ -94,6 +100,21 @@ function startLiveTranscode(hlsUrl) {
         }
         for (const res of activeLiveRequests) {
             res.write(chunk);
+            res.__liveBytesSent = (res.__liveBytesSent || 0) + chunk.length;
+            // Close as soon as this response has a full chunk's worth of
+            // audio, rather than waiting out a fixed wall-clock timer - that
+            // was the actual cause of the alternating silent/audio pattern:
+            // even once all the bytes had arrived, the response stayed open
+            // (so Twilio kept "downloading") for the rest of the fixed delay.
+            if (res.__liveBytesSent >= LIVE_CHUNK_BYTES) {
+                activeLiveRequests.delete(res);
+                if (res.__liveCloseTimer) {
+                    clearTimeout(res.__liveCloseTimer);
+                }
+                if (!res.writableEnded) {
+                    res.end();
+                }
+            }
         }
     });
 }
@@ -551,22 +572,32 @@ const server = http.createServer(async (req, res) => {
 
         // Replay the catch-up buffer so this request produces audio
         // immediately instead of waiting on the next data event from the
-        // (already-connected, persistent) transcode process.
+        // (already-connected, persistent) transcode process. With the buffer
+        // window kept above LIVE_CHUNK_SECONDS, this alone usually covers a
+        // full chunk, so the response below can close (and become playable
+        // to Twilio) right away instead of waiting on live data to trickle in.
         for (const { chunk } of liveTranscodeBuffer) {
             res.write(chunk);
+            res.__liveBytesSent = (res.__liveBytesSent || 0) + chunk.length;
+        }
+
+        if (res.__liveBytesSent >= LIVE_CHUNK_BYTES) {
+            res.end();
+            return;
         }
 
         activeLiveRequests.add(res);
 
-        // A bounded response, not an infinite pipe - see the LIVE_CHUNK_SECONDS
-        // comment above for why. The underlying connection to Kick stays open;
-        // only this individual caller's HTTP response closes on schedule.
+        // Safety net only - normal completion happens the instant this
+        // response hits LIVE_CHUNK_BYTES (see startLiveTranscode's data
+        // handler). This just guards against the transcoder stalling.
         const closeTimer = setTimeout(() => {
             activeLiveRequests.delete(res);
             if (!res.writableEnded) {
                 res.end();
             }
-        }, LIVE_CHUNK_SECONDS * 1000);
+        }, (LIVE_CHUNK_SECONDS + 15) * 1000);
+        res.__liveCloseTimer = closeTimer;
 
         req.on('close', () => {
             clearTimeout(closeTimer);
