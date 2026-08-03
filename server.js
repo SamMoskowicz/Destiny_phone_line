@@ -469,6 +469,15 @@ async function pollKickVideos() {
     }
 }
 
+function scheduleNextKickVideosPoll() {
+    const delay = KICK_VIDEOS_POLL_MIN_INTERVAL_MS
+        + Math.random() * (KICK_VIDEOS_POLL_MAX_INTERVAL_MS - KICK_VIDEOS_POLL_MIN_INTERVAL_MS);
+    setTimeout(async () => {
+        await pollKickVideos();
+        scheduleNextKickVideosPoll();
+    }, delay);
+}
+
 // The VOD playback URL Kick hands back is signed with a token that expires
 // ~1 hour after issuance, so it can't be stored permanently like an
 // admin-provided direct link. It's kept warm by pollKickVideos (on archive)
@@ -971,9 +980,12 @@ server.listen(port, () => {
         pollKickChannel();
         setInterval(pollKickChannel, KICK_POLL_INTERVAL_MS);
 
-        console.log(`Checking for new archived streams every ${KICK_VIDEOS_POLL_INTERVAL_MS}ms`);
+        console.log(
+            `Checking for new archived streams every ${KICK_VIDEOS_POLL_MIN_INTERVAL_MS}-`
+            + `${KICK_VIDEOS_POLL_MAX_INTERVAL_MS}ms (randomized)`
+        );
         pollKickVideos();
-        setInterval(pollKickVideos, KICK_VIDEOS_POLL_INTERVAL_MS);
+        scheduleNextKickVideosPoll();
 
         // pollKickVideos already warms the cache for anything newly archived;
         // this just keeps already-archived entries from going stale before a

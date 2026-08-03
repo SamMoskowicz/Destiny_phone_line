@@ -15,7 +15,7 @@ A simple voice-service backend for one streamer: Destiny.
 Kick's API blocks plain server-side requests (confirmed - identical 403 from multiple networks/HTTP clients regardless of headers), so both live-detection and VOD archiving run through a real headless Chrome (`src/kickBrowser.js`, Puppeteer + a stealth plugin) that behaves like an actual browser: it loads Destiny's Kick pages, and where needed does a genuine trusted click (not a synthetic JS click - the player only initiates real playback for a trusted input event) to trigger the same requests a real viewer's browser would make.
 
 - Every `KICK_POLL_INTERVAL_MS` (default 90s): checks live status and starts/stops the live relay.
-- Every `KICK_VIDEOS_POLL_INTERVAL_MS` (default 15 min): checks Destiny's videos list for any not-yet-archived VOD and adds it.
+- Every random interval between `KICK_VIDEOS_POLL_INTERVAL_MS` and `KICK_VIDEOS_POLL_MAX_INTERVAL_MS` (default 15-30 min, randomized so it isn't a perfectly predictable machine-like cadence): checks Destiny's videos list for any not-yet-archived VOD and adds it. Within a run, individual video pages are also fetched 1-3 minutes apart rather than back-to-back, and a video that just failed to archive isn't retried again for an hour - Kick's Cloudflare protection on individual video pages appears to score bursty/predictable automated traffic more harshly.
 - A VOD's actual playback URL is signed and expires ~1 hour after being fetched, so it isn't stored permanently - it's re-resolved (with a short-lived cache) the moment a caller actually plays that recording, not when it's archived.
 
 Because this is an undocumented/unofficial mechanism, it can break if Kick changes something. `GET /diagnostics/kick` reports whether the browser-based live check is currently working. If Kick ever blocks headless Chrome too, `POST /admin/stream/live` and `/admin/stream/recording` (below) still work as a fully manual fallback.
@@ -80,7 +80,8 @@ curl -X POST "${RENDER_URL}/admin/stream/recording" \
 - PORT: defaults to 3000 if omitted
 - KICK_CHANNEL: Kick channel slug to auto-detect live status and archive VODs for (e.g. `destiny`); leave unset to manage everything manually via the admin API
 - KICK_POLL_INTERVAL_MS: how often to check live status, in milliseconds; defaults to 90000
-- KICK_VIDEOS_POLL_INTERVAL_MS: how often to check for new VODs to archive, in milliseconds; defaults to 900000 (15 min)
+- KICK_VIDEOS_POLL_INTERVAL_MS: minimum time between checks for new VODs to archive, in milliseconds; defaults to 900000 (15 min)
+- KICK_VIDEOS_POLL_MAX_INTERVAL_MS: maximum time between those checks; defaults to double KICK_VIDEOS_POLL_INTERVAL_MS (so 15-30 min by default) - each check is scheduled at a random point in this range
 - ADMIN_TOKEN: protects the admin endpoints; leave unset only for local testing, since the endpoints are open to anyone if it's not set
 - PUBLIC_BASE_URL: base URL used to build playback links; normally unnecessary on Render (`RENDER_EXTERNAL_URL` is set automatically) but useful for local dev or other hosts
 - LIVE_HLS_URL: optional, manually pins the HLS source to relay at startup instead of using `KICK_CHANNEL` or the admin API
