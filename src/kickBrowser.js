@@ -1,5 +1,6 @@
 const puppeteerExtra = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const hlsFetch = require('./hlsFetch');
 
 puppeteerExtra.use(StealthPlugin());
 
@@ -11,6 +12,26 @@ const LAUNCH_ARGS = [
 ];
 
 let browserPromise = null;
+
+// Kick's playback API doesn't include an explicit broadcast start timestamp
+// anywhere in video_session, but the underlying AWS IVS storage path is
+// date-partitioned (.../2026/8/1/19/40/<id>/media/...) and that same
+// structure shows up in the thumbnail URL, which is already part of the
+// response we fetch - no extra request needed. Confirmed against real
+// responses: matches the segment paths in the actual HLS manifest too.
+// The path components are UTC (standard S3/IVS date partitioning).
+function extractBroadcastStartedAt(url) {
+    if (!url) {
+        return null;
+    }
+    const match = url.match(/\/(\d{4})\/(\d{1,2})\/(\d{1,2})\/(\d{1,2})\/(\d{1,2})\//);
+    if (!match) {
+        return null;
+    }
+    const [, year, month, day, hour, minute] = match.map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day, hour, minute));
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
 
 // Plain server-side requests to Kick's API are reliably blocked by Cloudflare
 // (confirmed from multiple networks, identical block regardless of headers).
@@ -169,12 +190,33 @@ async function getVodPlaybackInfo(slug, videoId) {
             );
         }
 
+        // The VOD manifest (web.kick.com) has to be fetched from inside this
+        // already-trusted page - a plain Node HTTPS request to that host
+        // gets a 403 regardless of headers or cookies (confirmed directly),
+        // while the CloudFront-hosted variant playlist and segments it
+        // points to fetch fine with plain HTTP once resolved. So the
+        // manifest fetch and parse happens here, but the actual segment
+        // downloads happen later via hlsFetch (plain Node), not through
+        // Puppeteer - no need to burden the browser with hundreds of them.
+        const manifestResult = await page.evaluate(async (url) => {
+            const res = await fetch(url);
+            return { status: res.status, text: await res.text() };
+        }, captured.playback_url.vod);
+
+        if (manifestResult.status !== 200) {
+            throw new Error(`Fetching VOD manifest returned ${manifestResult.status}`);
+        }
+
+        const segments = await hlsFetch.resolveSegmentsFromText(manifestResult.text, captured.playback_url.vod);
+
         const session = captured.video_session || {};
         return {
             audioUrl: captured.playback_url.vod,
+            segments,
             title: session.video_title || null,
             durationSeconds: session.video_duration || null,
-            category: session.video_content_type || null
+            category: session.video_content_type || null,
+            broadcastStartedAt: extractBroadcastStartedAt(captured.playback_url.thumbnail)
         };
     });
 }

@@ -27,6 +27,27 @@ function escapeXml(value) {
         .replace(/>/g, '&gt;');
 }
 
+const ANNOUNCEMENT_TIME_ZONE = 'America/New_York';
+
+// Fixed to a single timezone (not each caller's own) since there's no
+// reliable way to know where a caller actually is from just a phone number -
+// stated explicitly ("New York time") so it's unambiguous either way.
+function formatBroadcastStartedAt(isoString) {
+    if (!isoString) {
+        return null;
+    }
+    const date = new Date(isoString);
+    if (Number.isNaN(date.getTime())) {
+        return null;
+    }
+    const weekday = date.toLocaleString('en-US', { timeZone: ANNOUNCEMENT_TIME_ZONE, weekday: 'long' });
+    const monthDay = date.toLocaleString('en-US', { timeZone: ANNOUNCEMENT_TIME_ZONE, month: 'long', day: 'numeric' });
+    const time = date.toLocaleString('en-US', {
+        timeZone: ANNOUNCEMENT_TIME_ZONE, hour: 'numeric', minute: '2-digit', hour12: true
+    });
+    return `${weekday}, ${monthDay}, at ${time} New York time`;
+}
+
 class PhoneService {
     constructor({ streamerName = 'Destiny', storageFile } = {}) {
         this.streamerName = streamerName || 'Destiny';
@@ -190,11 +211,15 @@ class PhoneService {
         return { isLive: false };
     }
 
-    addRecording({ title, audioUrl = null, durationSeconds = 0, kickVideoId = null } = {}) {
+    addRecording({ title, audioUrl = null, durationSeconds = 0, kickVideoId = null, broadcastStartedAt = null } = {}) {
         const recording = {
             id: generateId(),
             title: title || `${this.streamerName} archived stream`,
             startedAt: new Date().toISOString(),
+            // When the broadcast actually happened, not when our server got
+            // around to archiving it (which can lag by a poll cycle or
+            // more) - null for admin-added recordings that don't have it.
+            broadcastStartedAt,
             audioUrl,
             durationSeconds: durationSeconds || 0,
             kickVideoId,
@@ -241,12 +266,17 @@ class PhoneService {
         this.startSegment(caller, recording.id, savedPosition);
         this.saveState();
 
+        const broadcastTime = formatBroadcastStartedAt(recording.broadcastStartedAt);
+        const message = broadcastTime
+            ? `You are now listening to ${recording.title}, from ${broadcastTime}.`
+            : `You are now listening to ${recording.title}.`;
+
         return {
             type: 'recording',
             recordingId: recording.id,
             title: recording.title,
             positionSeconds: savedPosition,
-            message: `You are now listening to ${recording.title}.`
+            message
         };
     }
 

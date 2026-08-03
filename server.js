@@ -4,6 +4,7 @@ const { spawn } = require('child_process');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const { PhoneService } = require('./src/phoneService');
 const kickBrowser = require('./src/kickBrowser');
+const hlsFetch = require('./src/hlsFetch');
 
 // Prefer an explicit system ffmpeg (set via Dockerfile on Render) over the
 // bundled @ffmpeg-installer/ffmpeg binary - see Dockerfile for why.
@@ -236,23 +237,44 @@ function stopArchiveSession(phoneNumber) {
     }
 }
 
-function startArchiveSession(phoneNumber, recordingId, audioUrl, startSeconds) {
+// Kick's HLS segments are fetched and piped in ourselves (see hlsFetch.js)
+// rather than handed to ffmpeg as a URL to fetch on its own - some of them
+// have no file extension, which trips ffmpeg's HLS demuxer safety check
+// (confirmed reproducible across multiple recordings, not a one-off), and
+// the top-level manifest URL itself needs browser-context fetching (a plain
+// request gets a 403). ffmpeg here only transcodes a raw byte stream fed to
+// its stdin - it never fetches or evaluates any of these URLs itself.
+//
+// `playbackSource` is either a resolved segment array (Kick-sourced
+// recordings) or a plain URL string (admin-added recordings with a direct
+// link and no Kick video ID) - the latter still lets ffmpeg fetch/seek the
+// URL itself, since there's no Kick manifest involved to trip on.
+function startArchiveSession(phoneNumber, recordingId, playbackSource, startSeconds) {
     stopArchiveSession(phoneNumber);
 
-    const proc = spawn(FFMPEG_PATH, [
-        // See startLiveTranscode - Kick's signed segment URLs are
-        // extension-less, which trips ffmpeg's HLS demuxer allowlist unless
-        // explicitly overridden.
-        '-allowed_extensions', 'ALL',
-        '-ss', String(startSeconds),
-        '-i', audioUrl,
-        '-vn',
-        '-c:a', 'libmp3lame',
-        '-b:a', '96k',
-        '-ar', '44100',
-        '-f', 'mp3',
-        '-'
-    ], { stdio: ['ignore', 'pipe', 'inherit'] });
+    const segments = Array.isArray(playbackSource) ? playbackSource : null;
+
+    const proc = segments
+        ? spawn(FFMPEG_PATH, [
+            '-f', 'mpegts',
+            '-i', 'pipe:0',
+            '-vn',
+            '-c:a', 'libmp3lame',
+            '-b:a', '96k',
+            '-ar', '44100',
+            '-f', 'mp3',
+            '-'
+        ], { stdio: ['pipe', 'pipe', 'inherit'] })
+        : spawn(FFMPEG_PATH, [
+            '-ss', String(startSeconds),
+            '-i', playbackSource,
+            '-vn',
+            '-c:a', 'libmp3lame',
+            '-b:a', '96k',
+            '-ar', '44100',
+            '-f', 'mp3',
+            '-'
+        ], { stdio: ['ignore', 'pipe', 'inherit'] });
 
     const session = {
         recordingId,
@@ -280,6 +302,28 @@ function startArchiveSession(phoneNumber, recordingId, audioUrl, startSeconds) {
         }
     });
 
+    if (segments) {
+        // ffmpeg exits (EPIPE) if we're still writing to stdin when it's
+        // killed or exits on its own - swallow it here so it doesn't crash
+        // the process; the 'exit' handler above already does real cleanup.
+        proc.stdin.on('error', () => {});
+
+        let elapsed = 0;
+        let startIndex = 0;
+        for (; startIndex < segments.length; startIndex++) {
+            if (elapsed >= startSeconds) {
+                break;
+            }
+            elapsed += segments[startIndex].duration;
+        }
+        feedSegmentsToStdin(proc, segments, startIndex).catch((error) => {
+            console.error(`Failed to feed archive segments for ${phoneNumber}: ${error.message}`);
+            if (!proc.killed) {
+                proc.kill('SIGKILL');
+            }
+        });
+    }
+
     proc.stdout.on('data', (chunk) => {
         session.bytesProducedTotal += chunk.length;
         if (session.currentRes && !session.currentRes.writableEnded) {
@@ -305,6 +349,37 @@ function startArchiveSession(phoneNumber, recordingId, audioUrl, startSeconds) {
     });
 
     return session;
+}
+
+// Fetches segments in order starting at startIndex and writes their raw
+// bytes to ffmpeg's stdin, honoring backpressure (waiting on 'drain' rather
+// than buffering the whole VOD in Node memory) - the same throttling
+// philosophy as the stdout side. A single bad segment is skipped rather than
+// aborting the whole session, since one failed fetch shouldn't kill an
+// otherwise-working stream.
+async function feedSegmentsToStdin(proc, segments, startIndex) {
+    for (let i = startIndex; i < segments.length; i++) {
+        if (proc.killed || proc.stdin.destroyed) {
+            return;
+        }
+        let buffer;
+        try {
+            buffer = await hlsFetch.fetchSegmentBuffer(segments[i].url);
+        } catch (error) {
+            console.error(`Failed to fetch archive segment: ${error.message}`);
+            continue;
+        }
+        if (proc.killed || proc.stdin.destroyed) {
+            return;
+        }
+        const canWriteMore = proc.stdin.write(buffer);
+        if (!canWriteMore) {
+            await new Promise((resolve) => proc.stdin.once('drain', resolve));
+        }
+    }
+    if (!proc.stdin.destroyed) {
+        proc.stdin.end();
+    }
 }
 
 function attachArchiveResponse(session, res) {
@@ -445,14 +520,15 @@ async function pollKickVideos() {
                     title: info.title || `${service.streamerName} archived stream`,
                     audioUrl: info.audioUrl,
                     durationSeconds: info.durationSeconds || 0,
-                    kickVideoId: nextVideoId
+                    kickVideoId: nextVideoId,
+                    broadcastStartedAt: info.broadcastStartedAt || null
                 });
                 archivedKickVideoIds.add(nextVideoId);
                 recentlyFailedKickVideoIds.delete(nextVideoId);
-                // Reuse the URL we just paid the Puppeteer cost to fetch, so
-                // the cache is already warm - a caller shouldn't be the one
-                // to trigger the first (slow) resolution for a recording.
-                vodUrlCache.set(nextVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
+                // Reuse the segments we just paid the Puppeteer cost to
+                // resolve, so the cache is already warm - a caller shouldn't
+                // be the one to trigger the first (slow) resolution.
+                vodUrlCache.set(nextVideoId, { segments: info.segments, resolvedAt: Date.now() });
                 console.log(`Archived Kick video ${nextVideoId}: ${info.title}`);
             } catch (error) {
                 recentlyFailedKickVideoIds.set(nextVideoId, Date.now());
@@ -491,7 +567,7 @@ async function warmStalestVodUrl() {
     }
     try {
         const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, target.kickVideoId);
-        vodUrlCache.set(target.kickVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
+        vodUrlCache.set(target.kickVideoId, { segments: info.segments, resolvedAt: Date.now() });
         console.log(`Pre-warmed playback URL for Kick video ${target.kickVideoId}`);
     } catch (error) {
         console.error(`Failed to warm playback URL for ${target.kickVideoId}: ${error.message}`);
@@ -507,30 +583,33 @@ function scheduleNextKickVideosPoll() {
     }, delay);
 }
 
-// The VOD playback URL Kick hands back is signed with a token that expires
-// ~1 hour after issuance, so it can't be stored permanently like an
-// admin-provided direct link. It's kept warm by pollKickVideos, both at
-// archive time and via warmStalestVodUrl's gentle one-at-a-time background
-// refresh - a caller pressing play should almost always hit a cache that's
-// already fresh, since a resolution failing (e.g. a Cloudflare block) right
-// when someone's actually trying to listen is the worst time for it to
-// happen. resolveRecordingAudioUrl below is still the on-demand fallback for
-// whatever the background pass hasn't gotten to yet.
+// The VOD manifest Kick hands back is signed with a token that expires ~1
+// hour after issuance, so the resolved segment list can't be stored
+// permanently like an admin-provided direct link. It's kept warm by
+// pollKickVideos, both at archive time and via warmStalestVodUrl's gentle
+// one-at-a-time background refresh - a caller pressing play should almost
+// always hit a cache that's already fresh, since a resolution failing (e.g.
+// a Cloudflare block) right when someone's actually trying to listen is the
+// worst time for it to happen. resolveRecordingPlayback below is still the
+// on-demand fallback for whatever the background pass hasn't gotten to yet.
 const vodUrlCache = new Map();
 
-async function resolveRecordingAudioUrl(recording) {
+// Returns either { segments } for a Kick-sourced recording (resolved via
+// kickBrowser/hlsFetch - see startArchiveSession) or { audioUrl } for an
+// admin-added recording with a plain direct link and no Kick video ID.
+async function resolveRecordingPlayback(recording) {
     if (!recording.kickVideoId) {
-        return recording.audioUrl;
+        return { audioUrl: recording.audioUrl };
     }
 
     const cached = vodUrlCache.get(recording.kickVideoId);
     if (cached && Date.now() - cached.resolvedAt < KICK_VOD_URL_TTL_MS) {
-        return cached.audioUrl;
+        return { segments: cached.segments };
     }
 
     const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, recording.kickVideoId);
-    vodUrlCache.set(recording.kickVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
-    return info.audioUrl;
+    vodUrlCache.set(recording.kickVideoId, { segments: info.segments, resolvedAt: Date.now() });
+    return { segments: info.segments };
 }
 
 function parseBody(req) {
@@ -682,9 +761,9 @@ const server = http.createServer(async (req, res) => {
         }
 
         const startedAt = Date.now();
-        let audioUrl;
+        let playback;
         try {
-            audioUrl = await resolveRecordingAudioUrl(recording);
+            playback = await resolveRecordingPlayback(recording);
         } catch (error) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, stage: 'resolve', error: error.message, resolveMs: Date.now() - startedAt }));
@@ -692,25 +771,29 @@ const server = http.createServer(async (req, res) => {
         }
         const resolveMs = Date.now() - startedAt;
 
-        // Same args /recordings/:id/play's persistent archive session uses
-        // in production (startArchiveSession), plus -loglevel verbose and a
-        // -t bound so this diagnostic actually terminates on its own instead
-        // of running indefinitely, so any failure here reproduces the real
-        // bug, not a simplified version of it.
+        if (!playback.segments) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Resolved to a direct URL, not Kick segments - nothing to test here' }));
+            return;
+        }
+
+        // Same path /recordings/:id/play's persistent archive session uses
+        // in production (startArchiveSession + feedSegmentsToStdin): ffmpeg
+        // only transcodes a raw stream we feed it, never fetches the segment
+        // URLs itself. -loglevel verbose and a segment-count cap so this
+        // terminates on its own instead of running indefinitely.
         const ffmpegStartedAt = Date.now();
         const proc = spawn(FFMPEG_PATH, [
             '-loglevel', 'verbose',
-            '-allowed_extensions', 'ALL',
-            '-ss', '0',
-            '-i', audioUrl,
-            '-t', String(ARCHIVE_CHUNK_SECONDS),
+            '-f', 'mpegts',
+            '-i', 'pipe:0',
             '-vn',
             '-c:a', 'libmp3lame',
             '-b:a', '96k',
             '-ar', '44100',
             '-f', 'mp3',
             '-'
-        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
         let stderr = '';
         let stdoutBytes = 0;
@@ -719,6 +802,13 @@ const server = http.createServer(async (req, res) => {
         });
         proc.stdout.on('data', (chunk) => {
             stdoutBytes += chunk.length;
+        });
+        proc.stdin.on('error', () => {});
+
+        const segmentsToFeed = playback.segments.slice(0, 10);
+        let segmentFetchError = null;
+        feedSegmentsToStdin(proc, segmentsToFeed, 0).catch((error) => {
+            segmentFetchError = error.message;
         });
 
         const result = await new Promise((resolve) => {
@@ -736,6 +826,9 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({
             ok: true,
             recordingTitle: recording.title,
+            totalSegments: playback.segments.length,
+            segmentsFedThisTest: segmentsToFeed.length,
+            segmentFetchError,
             stdoutBytes,
             resolveMs,
             ffmpegMs: Date.now() - ffmpegStartedAt,
@@ -866,9 +959,9 @@ const server = http.createServer(async (req, res) => {
         const caller = query.get('caller') || 'unknown-caller';
         const isContinue = query.get('continue') === '1';
 
-        let audioUrl;
+        let playback;
         try {
-            audioUrl = await resolveRecordingAudioUrl(recording);
+            playback = await resolveRecordingPlayback(recording);
         } catch (error) {
             console.error(`Failed to resolve playback URL for recording ${recording.id}: ${error.message}`);
             res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -911,7 +1004,7 @@ const server = http.createServer(async (req, res) => {
             }
         }
         if (!session) {
-            session = startArchiveSession(caller, recordingId, audioUrl, start);
+            session = startArchiveSession(caller, recordingId, playback.segments || playback.audioUrl, start);
         }
 
         attachArchiveResponse(session, res);
