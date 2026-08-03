@@ -52,9 +52,13 @@ const LIVE_CATCHUP_BUFFER_MS = (LIVE_CHUNK_SECONDS + 15) * 1000;
 const activeLiveRequests = new Set();
 let liveTranscodeProcess = null;
 let liveTranscodeBuffer = [];
+// True while reconnectLiveTranscode() is re-validating against Kick after an
+// unexpected death - blocks startLiveTranscode from being called elsewhere
+// (e.g. the /live.mp3 route) with the stale URL that just failed.
+let liveReconnecting = false;
 
 function startLiveTranscode(hlsUrl) {
-    if (!hlsUrl || liveTranscodeProcess) {
+    if (!hlsUrl || liveTranscodeProcess || liveReconnecting) {
         return;
     }
 
@@ -95,6 +99,13 @@ function startLiveTranscode(hlsUrl) {
                     res.end();
                 }
             }
+            activeLiveRequests.clear();
+            // An unexpected death mid-call is usually Kick's signed playback
+            // URL expiring (~20-30 min lifetime), not the broadcast ending -
+            // pollKickChannel can't catch this because it's deliberately
+            // paused for the whole time someone's listening. Re-validate
+            // against Kick directly instead of waiting for the next 90s poll.
+            reconnectLiveTranscode();
         }
     });
 
@@ -108,6 +119,10 @@ function startLiveTranscode(hlsUrl) {
             liveTranscodeBuffer.shift();
         }
         for (const res of activeLiveRequests) {
+            if (res.writableEnded) {
+                activeLiveRequests.delete(res);
+                continue;
+            }
             res.write(chunk);
             res.__liveBytesSent = (res.__liveBytesSent || 0) + chunk.length;
             // Close as soon as this response has a full chunk's worth of
@@ -140,6 +155,30 @@ function stopLiveTranscode() {
         }
     }
     activeLiveRequests.clear();
+}
+
+async function reconnectLiveTranscode() {
+    if (!KICK_CHANNEL || liveReconnecting) {
+        return;
+    }
+    liveReconnecting = true;
+    try {
+        const { isLive, hlsUrl } = await kickBrowser.checkLiveStatus(KICK_CHANNEL);
+        if (isLive && hlsUrl) {
+            liveRelayUrl = hlsUrl;
+            liveReconnecting = false;
+            startLiveTranscode(liveRelayUrl);
+        } else {
+            liveRelayUrl = null;
+            if (service.state.isLive) {
+                service.endStream();
+            }
+            liveReconnecting = false;
+        }
+    } catch (error) {
+        console.error(`Live reconnect failed: ${error.message}`);
+        liveReconnecting = false;
+    }
 }
 
 // Same reasoning applies to archived recordings: without a bound, ffmpeg
