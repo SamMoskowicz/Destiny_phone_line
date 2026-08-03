@@ -25,7 +25,6 @@ const KICK_VIDEOS_POLL_MAX_INTERVAL_MS = Number(
     process.env.KICK_VIDEOS_POLL_MAX_INTERVAL_MS || KICK_VIDEOS_POLL_MIN_INTERVAL_MS * 2
 );
 const KICK_VOD_URL_TTL_MS = 45 * 60 * 1000;
-const KICK_VOD_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
 
 let liveRelayUrl = process.env.LIVE_HLS_URL || null;
 
@@ -474,26 +473,17 @@ function scheduleNextKickVideosPoll() {
 
 // The VOD playback URL Kick hands back is signed with a token that expires
 // ~1 hour after issuance, so it can't be stored permanently like an
-// admin-provided direct link. It's kept warm by pollKickVideos (on archive)
-// and refreshVodCache (periodically) - this on-demand path is a safety net,
-// not the normal path, because resolving it live via Puppeteer takes 5-20+
-// seconds, which is longer than Twilio's <Play> fetch will tolerate.
+// admin-provided direct link. It's kept warm by pollKickVideos at archive
+// time, then resolved lazily here on whatever cadence callers actually play
+// a given recording - deliberately NOT proactively refreshed on a timer,
+// since that would mean periodically re-visiting Kick's more heavily
+// bot-protected video-detail page for every archived recording regardless of
+// whether anyone's about to listen, which is exactly the kind of traffic
+// pattern that seems to trigger Cloudflare's challenge on that route. The
+// cost is a one-time 5-20+ second live resolution the first time a specific
+// recording is played after its cache has gone stale - rare for a low-
+// traffic phone line, and worth it to keep total requests to that route low.
 const vodUrlCache = new Map();
-
-async function refreshVodCache() {
-    if (activeLiveRequests.size > 0) {
-        return;
-    }
-    const kickRecordings = service.state.recordings.filter((entry) => entry.kickVideoId && !entry.live);
-    for (const recording of kickRecordings) {
-        try {
-            const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, recording.kickVideoId);
-            vodUrlCache.set(recording.kickVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
-        } catch (error) {
-            console.error(`Failed to refresh playback URL for ${recording.kickVideoId}: ${error.message}`);
-        }
-    }
-}
 
 async function resolveRecordingAudioUrl(recording) {
     if (!recording.kickVideoId) {
@@ -983,12 +973,6 @@ server.listen(port, () => {
         );
         pollKickVideos();
         scheduleNextKickVideosPoll();
-
-        // pollKickVideos already warms the cache for anything newly archived;
-        // this just keeps already-archived entries from going stale before a
-        // caller needs them.
-        console.log(`Refreshing archived-stream playback URLs every ${KICK_VOD_REFRESH_INTERVAL_MS}ms`);
-        setInterval(refreshVodCache, KICK_VOD_REFRESH_INTERVAL_MS);
     } else {
         console.log('KICK_CHANNEL not set - start/stop the live stream manually via POST /admin/stream/live and /admin/stream/stop');
     }
