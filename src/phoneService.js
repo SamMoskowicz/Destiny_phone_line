@@ -60,12 +60,16 @@ class PhoneService {
     }
 
     buildMenuTwiML(customPrompt = null) {
-        const prompt = customPrompt || this.getMenuPrompt();
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${prompt}</Say>\n  </Gather>\n  <Say voice="alice">${prompt}</Say>\n</Response>`;
+        const menuPrompt = this.getMenuPrompt();
+        // A status/error message (e.g. "that recording is not available") gets
+        // said first, then a beat of silence, then the actual menu - otherwise
+        // it runs into the menu as one monotonous sentence.
+        const intro = customPrompt ? `\n  <Say voice="alice">${customPrompt}</Say>\n  <Pause length="1"/>` : '';
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${intro}\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${menuPrompt}</Say>\n  </Gather>\n  <Say voice="alice">${menuPrompt}</Say>\n</Response>`;
     }
 
     buildControlsInfoTwiML() {
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${this.getControlsInfoPrompt()}</Say>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${this.getMenuPrompt()}</Say>\n  </Gather>\n  <Say voice="alice">${this.getMenuPrompt()}</Say>\n</Response>`;
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${this.getControlsInfoPrompt()}</Say>\n  <Pause length="1"/>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${this.getMenuPrompt()}</Say>\n  </Gather>\n  <Say voice="alice">${this.getMenuPrompt()}</Say>\n</Response>`;
     }
 
     buildPlaybackTwiML(prompt, audioUrl = null) {
@@ -86,7 +90,7 @@ class PhoneService {
             // quickly instead of sitting on dead air waiting for a keypress.
             return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="2" finishOnKey="">\n    <Play>${audioUrl}</Play>\n  </Gather>\n  <Redirect>/voice/live-continue</Redirect>\n</Response>`;
         }
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${prompt}</Say>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${prompt}</Say>\n  <Pause length="1"/>\n  <Redirect>/voice/menu</Redirect>\n</Response>`;
     }
 
     ensureCaller(phoneNumber) {
