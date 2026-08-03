@@ -30,16 +30,25 @@ let liveRelayUrl = process.env.LIVE_HLS_URL || null;
 // NOT do is re-establish the connection to Kick per chunk: that reconnect
 // (DNS + TLS + manifest + first segment) was the dominant cause of an audible
 // ~10s gap between chunks. Instead one transcode process stays connected in
-// the background for as long as the stream is live, feeding a small catch-up
-// buffer that each new chunk request replays instantly before tailing live data.
-const LIVE_CHUNK_SECONDS = 18;
+// the background for as long as the stream is live, feeding a catch-up buffer
+// that runs comfortably ahead of LIVE_CHUNK_SECONDS. That means every chunk -
+// not just the first - gets served from audio that was already fully
+// transcoded before it was ever requested, so the fetch itself is always
+// near-instant instead of occasionally waiting on live data to trickle in.
+// The 30s Twilio fetch-timeout above is about how long Twilio will wait to
+// download the file, not how long the resulting audio is allowed to play for -
+// since the download is already fast (pre-buffered), a longer chunk here just
+// means the one unavoidable Twilio-side pause between chunks (the Gather
+// timeout after <Play> finishes) happens less often, at the cost of running
+// this far behind the true live edge.
+const LIVE_CHUNK_SECONDS = 60;
 const LIVE_AUDIO_BYTES_PER_SECOND = (96 * 1000) / 8; // matches -b:a 96k below
 const LIVE_CHUNK_BYTES = LIVE_AUDIO_BYTES_PER_SECOND * LIVE_CHUNK_SECONDS;
 // Kept comfortably above LIVE_CHUNK_SECONDS worth of audio: as long as the
 // transcoder has been running for a while, a fresh request can be satisfied
 // entirely out of this buffer and close (and thus become playable to Twilio)
 // in well under a second, instead of waiting out a fixed real-time delay.
-const LIVE_CATCHUP_BUFFER_MS = (LIVE_CHUNK_SECONDS + 7) * 1000;
+const LIVE_CATCHUP_BUFFER_MS = (LIVE_CHUNK_SECONDS + 15) * 1000;
 const activeLiveRequests = new Set();
 let liveTranscodeProcess = null;
 let liveTranscodeBuffer = [];
