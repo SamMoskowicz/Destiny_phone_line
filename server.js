@@ -172,6 +172,12 @@ for (const recording of service.state.recordings) {
 }
 
 async function pollKickVideos() {
+    // Chrome (Puppeteer) and ffmpeg competing for the same CPU core can stall
+    // audio delivery to an actively-listening caller badly enough that Twilio
+    // gives up on the stream - defer background archiving until nobody's live.
+    if (liveRelayClients.size > 0) {
+        return;
+    }
     try {
         const videoIds = await kickBrowser.listRecentVideoIds(KICK_CHANNEL, 5);
         for (const videoId of videoIds) {
@@ -210,6 +216,9 @@ async function pollKickVideos() {
 const vodUrlCache = new Map();
 
 async function refreshVodCache() {
+    if (liveRelayClients.size > 0) {
+        return;
+    }
     const kickRecordings = service.state.recordings.filter((entry) => entry.kickVideoId && !entry.live);
     for (const recording of kickRecordings) {
         try {
