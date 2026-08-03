@@ -28,6 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Pinned to a fixed in-image path (rather than the default ~/.cache/puppeteer)
+# because Render's build-time HOME and runtime HOME differ - Chromium would
+# download during the build to one path and then be looked for at another,
+# failing with "Could not find Chrome" at runtime.
+ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
+
 COPY package*.json ./
 RUN npm install --omit=dev
 
