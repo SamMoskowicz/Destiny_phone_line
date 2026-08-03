@@ -79,6 +79,12 @@ function startLiveTranscode(hlsUrl) {
     // Kick's encoder produces them), so this doesn't risk racing ahead in
     // steady state - only removes an artificial slowdown.
     const proc = spawn(FFMPEG_PATH, [
+        // Kick's signed segment URLs don't end in a recognized media
+        // extension (e.g. .../production-kick-vod/<uuid>/0/0, no .ts
+        // suffix) - ffmpeg's HLS demuxer rejects fetching those by default
+        // (its own "not in allowed_segment_extensions" error) unless told
+        // to allow them.
+        '-allowed_extensions', 'ALL',
         '-i', hlsUrl,
         '-vn',
         '-c:a', 'libmp3lame',
@@ -230,6 +236,10 @@ function startArchiveSession(phoneNumber, recordingId, audioUrl, startSeconds) {
     stopArchiveSession(phoneNumber);
 
     const proc = spawn(FFMPEG_PATH, [
+        // See startLiveTranscode - Kick's signed segment URLs are
+        // extension-less, which trips ffmpeg's HLS demuxer allowlist unless
+        // explicitly overridden.
+        '-allowed_extensions', 'ALL',
         '-ss', String(startSeconds),
         '-i', audioUrl,
         '-vn',
@@ -389,13 +399,16 @@ for (const recording of service.state.recordings) {
     }
 }
 
-// Hitting all 5 video pages back-to-back looked bot-like enough to be part of
-// what triggers Cloudflare's challenge on that route - don't retry a video
-// that just failed again next cycle (every 15 min) while it's still likely
-// blocked, and space out attempts within a run instead of bursting them.
+// Hitting several video pages in one run - even spaced out - is still more
+// requests to Kick's more heavily bot-protected video-detail route than a
+// single visit. So each poll cycle attempts at most ONE not-yet-archived
+// video (newest first); the next-oldest one only gets tried on a later
+// cycle, once the randomized poll interval fires again. Catching up on
+// several missing recordings now takes multiple cycles instead of one run,
+// which is the intentional trade for looking as little like a scripted
+// crawler as possible. A video that just failed isn't retried again for an
+// hour, so a Cloudflare block on one doesn't get re-triggered every cycle.
 const KICK_VIDEO_RETRY_BACKOFF_MS = 60 * 60 * 1000;
-const KICK_VIDEO_MIN_SPACING_MS = 60 * 1000;
-const KICK_VIDEO_MAX_SPACING_MS = 3 * 60 * 1000;
 const recentlyFailedKickVideoIds = new Map(); // videoId -> failedAt
 let pollingVideosInProgress = false;
 
@@ -406,61 +419,42 @@ async function pollKickVideos() {
     if (activeLiveRequests.size > 0) {
         return;
     }
-    // A run can now take several minutes (spacing below), so guard against
-    // the next scheduled tick starting a second run on top of one still going.
     if (pollingVideosInProgress) {
         return;
     }
     pollingVideosInProgress = true;
     try {
         const videoIds = await kickBrowser.listRecentVideoIds(KICK_CHANNEL, 5);
-        let attemptedAny = false;
-        for (const videoId of videoIds) {
-            // Re-checked per video (not just once at the top) - archiving all
-            // 5 can take minutes, and a caller can connect to the live stream
-            // partway through an already-running poll.
-            if (activeLiveRequests.size > 0) {
-                console.log('Pausing Kick video archiving: a caller is listening live');
-                return;
-            }
+        const nextVideoId = videoIds.find((videoId) => {
             if (archivedKickVideoIds.has(videoId)) {
-                continue;
+                return false;
             }
             const failedAt = recentlyFailedKickVideoIds.get(videoId);
-            if (failedAt && Date.now() - failedAt < KICK_VIDEO_RETRY_BACKOFF_MS) {
-                continue;
-            }
+            return !failedAt || Date.now() - failedAt >= KICK_VIDEO_RETRY_BACKOFF_MS;
+        });
 
-            if (attemptedAny) {
-                const delayMs = KICK_VIDEO_MIN_SPACING_MS
-                    + Math.random() * (KICK_VIDEO_MAX_SPACING_MS - KICK_VIDEO_MIN_SPACING_MS);
-                await new Promise((resolve) => setTimeout(resolve, delayMs));
-                if (activeLiveRequests.size > 0) {
-                    console.log('Pausing Kick video archiving: a caller is listening live');
-                    return;
-                }
-            }
-            attemptedAny = true;
+        if (!nextVideoId) {
+            return;
+        }
 
-            try {
-                const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, videoId);
-                service.addRecording({
-                    title: info.title || `${service.streamerName} archived stream`,
-                    audioUrl: info.audioUrl,
-                    durationSeconds: info.durationSeconds || 0,
-                    kickVideoId: videoId
-                });
-                archivedKickVideoIds.add(videoId);
-                recentlyFailedKickVideoIds.delete(videoId);
-                // Reuse the URL we just paid the Puppeteer cost to fetch, so
-                // the cache is already warm - a caller shouldn't be the one
-                // to trigger the first (slow) resolution for a recording.
-                vodUrlCache.set(videoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
-                console.log(`Archived Kick video ${videoId}: ${info.title}`);
-            } catch (error) {
-                recentlyFailedKickVideoIds.set(videoId, Date.now());
-                console.error(`Failed to archive Kick video ${videoId}: ${error.message}`);
-            }
+        try {
+            const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, nextVideoId);
+            service.addRecording({
+                title: info.title || `${service.streamerName} archived stream`,
+                audioUrl: info.audioUrl,
+                durationSeconds: info.durationSeconds || 0,
+                kickVideoId: nextVideoId
+            });
+            archivedKickVideoIds.add(nextVideoId);
+            recentlyFailedKickVideoIds.delete(nextVideoId);
+            // Reuse the URL we just paid the Puppeteer cost to fetch, so
+            // the cache is already warm - a caller shouldn't be the one
+            // to trigger the first (slow) resolution for a recording.
+            vodUrlCache.set(nextVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
+            console.log(`Archived Kick video ${nextVideoId}: ${info.title}`);
+        } catch (error) {
+            recentlyFailedKickVideoIds.set(nextVideoId, Date.now());
+            console.error(`Failed to archive Kick video ${nextVideoId}: ${error.message}`);
         }
     } catch (error) {
         console.error(`Kick videos poll failed: ${error.message}`);
@@ -673,12 +667,15 @@ const server = http.createServer(async (req, res) => {
         }
         const resolveMs = Date.now() - startedAt;
 
-        // Exactly the same args /recordings/:id/play uses in production
-        // (including -ss and real mp3 encoding, not a discarded null output),
-        // so any failure here reproduces the real bug, not a simplified version of it.
+        // Same args /recordings/:id/play's persistent archive session uses
+        // in production (startArchiveSession), plus -loglevel verbose and a
+        // -t bound so this diagnostic actually terminates on its own instead
+        // of running indefinitely, so any failure here reproduces the real
+        // bug, not a simplified version of it.
         const ffmpegStartedAt = Date.now();
         const proc = spawn(FFMPEG_PATH, [
             '-loglevel', 'verbose',
+            '-allowed_extensions', 'ALL',
             '-ss', '0',
             '-i', audioUrl,
             '-t', String(ARCHIVE_CHUNK_SECONDS),
