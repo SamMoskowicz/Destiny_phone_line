@@ -1,4 +1,5 @@
 const http = require('http');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const { PhoneService } = require('./src/phoneService');
@@ -338,6 +339,31 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: error.message }));
         }
+        return;
+    }
+
+    // Temporary: shows exactly what this container sees for the Chromium
+    // cache location, to tell apart "the fix didn't deploy" from "the fix
+    // deployed but doesn't work". Safe to remove once the Chrome issue is resolved.
+    if (req.url === '/diagnostics/env') {
+        const cacheDir = process.env.PUPPETEER_CACHE_DIR || null;
+        let dirListing = null;
+        let dirError = null;
+        if (cacheDir) {
+            try {
+                dirListing = fs.readdirSync(cacheDir, { recursive: true });
+            } catch (error) {
+                dirError = error.message;
+            }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: true,
+            PUPPETEER_CACHE_DIR: cacheDir,
+            HOME: process.env.HOME || null,
+            dirListing,
+            dirError
+        }));
         return;
     }
 
