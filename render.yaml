@@ -8,3 +8,7 @@ services:
     envVars:
       - key: STREAMER_NAME
         value: Destiny
+      - key: KICK_CHANNEL
+        value: destiny
+      - key: ADMIN_TOKEN
+        sync: false

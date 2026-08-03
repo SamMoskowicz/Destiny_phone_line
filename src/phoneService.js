@@ -47,12 +47,18 @@ class PhoneService {
     }
 
     getMenuPrompt() {
-        const basePrompt = `For Destiny, press 1 to hear the live stream. Press 2 through 6 to hear the five most recent recorded streams, from newest to oldest. Press 7 to continue the last recorded stream you listened to.`;
-        return this.state.isLive ? basePrompt : `There is no live stream currently for Destiny. ${basePrompt}`;
+        const liveLine = this.state.isLive
+            ? `To hear Destiny's live stream, press 1.`
+            : `There is no live stream right now.`;
+        return `${liveLine} Press 2 through 6 for the last five archived streams. Press 7 to hear the playback controls.`;
+    }
+
+    getControlsInfoPrompt() {
+        return 'During playback: press 1 to pause, 2 to resume, 3 to skip ahead, 4 to go back, 5 for the menu, or 6 to jump to live.';
     }
 
     getPlaybackControlsPrompt() {
-        return 'Press 1 to pause, 2 to resume, 3 to skip forward, 4 to go backward, 5 to return to the menu, 6 to jump to the live point.';
+        return '';
     }
 
     buildMenuTwiML(customPrompt = null) {
@@ -60,9 +66,22 @@ class PhoneService {
         return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${prompt}</Say>\n  </Gather>\n  <Say voice="alice">${prompt}</Say>\n</Response>`;
     }
 
+    buildControlsInfoTwiML() {
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${this.getControlsInfoPrompt()}</Say>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${this.getMenuPrompt()}</Say>\n  </Gather>\n  <Say voice="alice">${this.getMenuPrompt()}</Say>\n</Response>`;
+    }
+
     buildPlaybackTwiML(prompt, audioUrl = null) {
         const audioSection = audioUrl ? `\n  <Play>${audioUrl}</Play>` : '';
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="5">\n    <Say voice="alice">${prompt}</Say>\n    <Say voice="alice">${this.getPlaybackControlsPrompt()}</Say>${audioSection}\n  </Gather>\n</Response>`;
+        const controls = this.getPlaybackControlsPrompt();
+        const controlsSay = controls ? `\n    <Say voice="alice">${controls}</Say>` : '';
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Gather action="/voice/playback" numDigits="1" timeout="5">\n    <Say voice="alice">${prompt}</Say>${controlsSay}${audioSection}\n  </Gather>\n</Response>`;
+    }
+
+    buildLiveStreamTwiML(prompt, audioUrl = null) {
+        if (audioUrl) {
+            return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Play>${audioUrl}</Play>\n</Response>`;
+        }
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${prompt}</Say>\n</Response>`;
     }
 
     ensureCaller(phoneNumber) {
@@ -85,12 +104,13 @@ class PhoneService {
         }
     }
 
-    startStream({ audioUrl = null } = {}) {
+    startStream({ audioUrl = null, sourceUrl = null } = {}) {
         const recording = {
             id: generateId(),
             title: `${this.streamerName} live stream`,
             startedAt: new Date().toISOString(),
             audioUrl,
+            sourceUrl,
             durationSeconds: 0,
             live: true
         };
@@ -133,6 +153,7 @@ class PhoneService {
 
     selectLiveStream(phoneNumber) {
         const caller = this.ensureCaller(phoneNumber);
+        const liveRecording = this.state.recordings.find((entry) => entry.id === this.state.currentLiveRecordingId);
         caller.lastRecordingId = this.state.currentLiveRecordingId;
         caller.lastPositionSeconds = 0;
         caller.lastVisitedAt = new Date().toISOString();
@@ -141,6 +162,7 @@ class PhoneService {
             type: 'live',
             recordingId: this.state.currentLiveRecordingId,
             positionSeconds: 0,
+            audioUrl: liveRecording ? liveRecording.audioUrl : null,
             message: this.state.isLive ? 'You are now listening to the live stream.' : 'There is no live stream currently.'
         };
     }
@@ -163,6 +185,7 @@ class PhoneService {
             recordingId: recording.id,
             title: recording.title,
             positionSeconds: savedPosition,
+            audioUrl: recording.audioUrl,
             message: `You are now listening to ${recording.title}.`
         };
     }
@@ -188,6 +211,7 @@ class PhoneService {
             recordingId: recording.id,
             title: recording.title,
             positionSeconds: savedPosition,
+            audioUrl: recording.audioUrl,
             message: `Continuing ${recording.title} from your saved position.`
         };
     }

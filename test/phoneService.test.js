@@ -5,17 +5,31 @@ const path = require('path');
 const os = require('os');
 const { PhoneService } = require('../src/phoneService');
 
-test('menu announces live status and records the correct menu prompt', () => {
+test('menu announces live status and lists the other options', () => {
     const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}.json`);
     const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
 
-    assert.match(service.getMenuPrompt(), /press 1 to hear the live stream/i);
-    assert.match(service.getMenuPrompt(), /Press 2 through 6/i);
+    assert.match(service.getMenuPrompt(), /no live stream/i);
+    assert.match(service.getMenuPrompt(), /2 through 6/i);
+    assert.match(service.getMenuPrompt(), /press 7/i);
 
     service.startStream();
-    assert.match(service.getMenuPrompt(), /press 1 to hear the live stream/i);
+    assert.match(service.getMenuPrompt(), /press 1/i);
 
     fs.unlinkSync(tempFile);
+});
+
+test('controls info TwiML explains playback keys and returns to the menu', () => {
+    const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
+    const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+
+    const twiml = service.buildControlsInfoTwiML();
+    assert.match(twiml, /pause/i);
+    assert.match(twiml, /action="\/voice\/menu"/);
+
+    if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+    }
 });
 
 test('keeps only five recent recordings and remembers caller progress', () => {
@@ -59,6 +73,7 @@ test('playback controls expose pause resume and menu options', () => {
 test('builds a TwiML menu response for Destiny', () => {
     const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
     const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+    service.startStream();
 
     const twiml = service.buildMenuTwiML();
     assert.match(twiml, /<Response>/);
