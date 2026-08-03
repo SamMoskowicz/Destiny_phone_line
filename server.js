@@ -16,7 +16,14 @@ const service = new PhoneService({
 
 const KICK_CHANNEL = process.env.KICK_CHANNEL || null;
 const KICK_POLL_INTERVAL_MS = Number(process.env.KICK_POLL_INTERVAL_MS || 90000);
-const KICK_VIDEOS_POLL_INTERVAL_MS = Number(process.env.KICK_VIDEOS_POLL_INTERVAL_MS || 900000);
+// A perfectly exact interval, forever, is itself a machine-like pattern - the
+// video-archiving poll (unlike the live-status poll, which needs to be
+// reasonably prompt) has no real reason to be that predictable, so it's
+// scheduled at a random point within [min, max] instead of a fixed tick.
+const KICK_VIDEOS_POLL_MIN_INTERVAL_MS = Number(process.env.KICK_VIDEOS_POLL_INTERVAL_MS || 900000);
+const KICK_VIDEOS_POLL_MAX_INTERVAL_MS = Number(
+    process.env.KICK_VIDEOS_POLL_MAX_INTERVAL_MS || KICK_VIDEOS_POLL_MIN_INTERVAL_MS * 2
+);
 const KICK_VOD_URL_TTL_MS = 45 * 60 * 1000;
 const KICK_VOD_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
 
