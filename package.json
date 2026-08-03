@@ -11,6 +11,12 @@
         "test": "node --test"
     },
     "dependencies": {
-        "@ffmpeg-installer/ffmpeg": "^1.1.0"
+        "@ffmpeg-installer/ffmpeg": "^1.1.0",
+        "puppeteer": "^25.4.0",
+        "puppeteer-extra": "^3.3.6",
+        "puppeteer-extra-plugin-stealth": "^2.11.2"
+    },
+    "allowScripts": {
+        "puppeteer@25.4.0": true
     }
 }

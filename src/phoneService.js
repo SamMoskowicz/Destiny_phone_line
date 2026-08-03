@@ -161,13 +161,14 @@ class PhoneService {
         return { isLive: false };
     }
 
-    addRecording({ title, audioUrl = null } = {}) {
+    addRecording({ title, audioUrl = null, durationSeconds = 0, kickVideoId = null } = {}) {
         const recording = {
             id: generateId(),
             title: title || `${this.streamerName} archived stream`,
             startedAt: new Date().toISOString(),
             audioUrl,
-            durationSeconds: 0,
+            durationSeconds: durationSeconds || 0,
+            kickVideoId,
             live: false
         };
 

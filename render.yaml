@@ -1,10 +1,9 @@
 services:
   - type: web
     name: destiny-stream-phone-line
-    env: node
-    plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
     envVars:
       - key: STREAMER_NAME
         value: Destiny

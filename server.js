@@ -2,6 +2,7 @@ const http = require('http');
 const { spawn } = require('child_process');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const { PhoneService } = require('./src/phoneService');
+const kickBrowser = require('./src/kickBrowser');
 
 const service = new PhoneService({
     streamerName: process.env.STREAMER_NAME || 'Destiny',
@@ -9,7 +10,9 @@ const service = new PhoneService({
 });
 
 const KICK_CHANNEL = process.env.KICK_CHANNEL || null;
-const KICK_POLL_INTERVAL_MS = Number(process.env.KICK_POLL_INTERVAL_MS || 60000);
+const KICK_POLL_INTERVAL_MS = Number(process.env.KICK_POLL_INTERVAL_MS || 90000);
+const KICK_VIDEOS_POLL_INTERVAL_MS = Number(process.env.KICK_VIDEOS_POLL_INTERVAL_MS || 900000);
+const KICK_VOD_URL_TTL_MS = 45 * 60 * 1000;
 
 const liveRelayClients = new Set();
 let liveRelayProcess = null;
@@ -123,30 +126,9 @@ function ensureLiveRelay() {
     }
 }
 
-// Kick's playback_url isn't part of their documented developer API - this hits
-// the same undocumented endpoint tools like streamlink use. It can change or
-// get Cloudflare-blocked from a datacenter IP; POST /admin/stream/live with an
-// explicit audioUrl always works as a manual fallback if polling stops working.
-async function fetchKickLiveHlsUrl(channelSlug) {
-    const response = await fetch(`https://kick.com/api/v1/channels/${encodeURIComponent(channelSlug)}`, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-            'Accept': 'application/json'
-        }
-    });
-
-    if (!response.ok) {
-        throw new Error(`Kick API returned ${response.status}`);
-    }
-
-    const data = await response.json();
-    const isLive = Boolean(data && data.livestream && data.livestream.is_live);
-    return { isLive, hlsUrl: isLive ? data.playback_url || null : null };
-}
-
 async function pollKickChannel() {
     try {
-        const { isLive, hlsUrl } = await fetchKickLiveHlsUrl(KICK_CHANNEL);
+        const { isLive, hlsUrl } = await kickBrowser.checkLiveStatus(KICK_CHANNEL);
 
         if (isLive && hlsUrl) {
             // Only start a fresh "recording" on an offline->live transition. A
@@ -170,8 +152,64 @@ async function pollKickChannel() {
             liveRelayUrl = null;
         }
     } catch (error) {
-        console.error(`Kick poll failed: ${error.message}`);
+        console.error(`Kick live poll failed: ${error.message}`);
     }
+}
+
+// Kick video IDs already archived, so re-polling the videos list doesn't
+// re-add (and re-resolve a fresh playback URL for) the same stream every tick.
+const archivedKickVideoIds = new Set();
+for (const recording of service.state.recordings) {
+    if (recording.kickVideoId) {
+        archivedKickVideoIds.add(recording.kickVideoId);
+    }
+}
+
+async function pollKickVideos() {
+    try {
+        const videoIds = await kickBrowser.listRecentVideoIds(KICK_CHANNEL, 5);
+        for (const videoId of videoIds) {
+            if (archivedKickVideoIds.has(videoId)) {
+                continue;
+            }
+            try {
+                const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, videoId);
+                service.addRecording({
+                    title: info.title || `${service.streamerName} archived stream`,
+                    audioUrl: info.audioUrl,
+                    durationSeconds: info.durationSeconds || 0,
+                    kickVideoId: videoId
+                });
+                archivedKickVideoIds.add(videoId);
+                console.log(`Archived Kick video ${videoId}: ${info.title}`);
+            } catch (error) {
+                console.error(`Failed to archive Kick video ${videoId}: ${error.message}`);
+            }
+        }
+    } catch (error) {
+        console.error(`Kick videos poll failed: ${error.message}`);
+    }
+}
+
+// The VOD playback URL Kick hands back is signed with a token that expires
+// ~1 hour after issuance, so it can't be stored permanently like an
+// admin-provided direct link. Resolve it fresh (short-TTL cached) the moment
+// someone actually plays that recording, not when it's archived.
+const vodUrlCache = new Map();
+
+async function resolveRecordingAudioUrl(recording) {
+    if (!recording.kickVideoId) {
+        return recording.audioUrl;
+    }
+
+    const cached = vodUrlCache.get(recording.kickVideoId);
+    if (cached && Date.now() - cached.resolvedAt < KICK_VOD_URL_TTL_MS) {
+        return cached.audioUrl;
+    }
+
+    const info = await kickBrowser.getVodPlaybackInfo(KICK_CHANNEL, recording.kickVideoId);
+    vodUrlCache.set(recording.kickVideoId, { audioUrl: info.audioUrl, resolvedAt: Date.now() });
+    return info.audioUrl;
 }
 
 function parseBody(req) {
@@ -288,20 +326,14 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Temporary: reports whether Kick's API is reachable from this deployment's
-    // network, without leaking anything sensitive. Safe to remove once we know.
+    // Reports whether the headless-browser Kick check is working from this
+    // deployment's network, without leaking anything sensitive.
     if (req.url === '/diagnostics/kick') {
         const slug = KICK_CHANNEL || 'destiny';
         try {
-            const response = await fetch(`https://kick.com/api/v1/channels/${encodeURIComponent(slug)}`, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-                    'Accept': 'application/json'
-                }
-            });
-            const bodyText = await response.text();
+            const result = await kickBrowser.checkLiveStatus(slug);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, kickStatus: response.status, bodyPreview: bodyText.slice(0, 300) }));
+            res.end(JSON.stringify({ ok: true, ...result }));
         } catch (error) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: error.message }));
@@ -352,6 +384,16 @@ const server = http.createServer(async (req, res) => {
         const query = new URLSearchParams(match[2] || '');
         const start = Math.max(0, Number(query.get('start')) || 0);
 
+        let audioUrl;
+        try {
+            audioUrl = await resolveRecordingAudioUrl(recording);
+        } catch (error) {
+            console.error(`Failed to resolve playback URL for recording ${recording.id}: ${error.message}`);
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Could not resolve playback URL' }));
+            return;
+        }
+
         res.writeHead(200, {
             'Content-Type': 'audio/mpeg',
             'Connection': 'close',
@@ -364,7 +406,7 @@ const server = http.createServer(async (req, res) => {
         // position - -ss before -i does an efficient input-side seek.
         const proc = spawn(ffmpegInstaller.path, [
             '-ss', String(start),
-            '-i', recording.audioUrl,
+            '-i', audioUrl,
             '-vn',
             '-c:a', 'libmp3lame',
             '-b:a', '96k',
@@ -467,7 +509,20 @@ server.listen(port, () => {
         console.log(`Auto-detecting live status for Kick channel "${KICK_CHANNEL}" every ${KICK_POLL_INTERVAL_MS}ms`);
         pollKickChannel();
         setInterval(pollKickChannel, KICK_POLL_INTERVAL_MS);
+
+        console.log(`Checking for new archived streams every ${KICK_VIDEOS_POLL_INTERVAL_MS}ms`);
+        pollKickVideos();
+        setInterval(pollKickVideos, KICK_VIDEOS_POLL_INTERVAL_MS);
     } else {
         console.log('KICK_CHANNEL not set - start/stop the live stream manually via POST /admin/stream/live and /admin/stream/stop');
     }
 });
+
+async function shutdown() {
+    stopLiveRelay();
+    await kickBrowser.shutdown();
+    server.close(() => process.exit(0));
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
