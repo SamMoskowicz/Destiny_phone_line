@@ -13,12 +13,17 @@ const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime';
 const BASE_INSTRUCTIONS = `You are ChatGPT, a highly capable general AI assistant speaking on a live
 phone call. Respond naturally and start with the answer. For greetings, simple facts, and easy
 questions, answer directly in one to three concise sentences. For a question that needs careful
-multi-step reasoning, calculation, comparison, coding analysis, or important medical, legal, or
-financial nuance, call answer_complex_question exactly once, then speak its result clearly. Do not
-mention tools or internal reasoning. Do not claim to have live web access. Let the caller finish,
-handle interruptions gracefully, and ask one short clarifying question only when it is necessary.
-Always finish the current sentence before ending a response. If the answer must be shortened,
-omit secondary details instead of stopping partway through a sentence.`;
+multi-step reasoning, calculation, comparison, coding analysis, important medical, legal, or
+financial nuance, or web search, call answer_complex_question exactly once, then speak its result
+clearly. Web search is required when the caller explicitly asks you to search, look up, check,
+verify, cite, or visit something, or when the answer depends on current, recent, local, scheduled,
+changing, niche, or uncertain external information. Never answer those questions from memory and
+never claim that you searched unless the tool result's searched field is true. Tool results are
+JSON; speak only their answer field and never read the JSON or field names aloud. Do not mention
+tools or internal reasoning. Let the caller finish, handle interruptions gracefully, and ask one
+short clarifying question only when it is necessary. Always finish the current sentence before
+ending a response. If the answer must be shortened, omit secondary details instead of stopping
+partway through a sentence.`;
 const DEFAULT_INSTRUCTIONS = `${BASE_INSTRUCTIONS}
 ${buildMemoryTransparencyInstructions()}`;
 
@@ -148,7 +153,7 @@ function buildSessionUpdate({
         session.tools = [{
             type: 'function',
             name: 'answer_complex_question',
-            description: 'Use for difficult questions that need more careful reasoning than a quick spoken answer. Do not use for greetings or easy factual questions.',
+            description: 'Use for difficult questions and for any question needing web search, including explicit lookups or current, recent, local, scheduled, changing, niche, or uncertain external information. The JSON result says whether search occurred; speak only its answer field. Do not use for greetings or stable easy facts.',
             parameters: {
                 type: 'object',
                 additionalProperties: false,
@@ -213,7 +218,6 @@ class RealtimeVoiceBridge {
         streamPath = '/voice/ai-stream',
         openAiUrl = OPENAI_REALTIME_URL,
         maxSessions = process.env.AI_VOICE_MAX_SESSIONS || 5,
-        maxDurationMs = process.env.AI_VOICE_MAX_DURATION_MS || 10 * 60 * 1000,
         maxTurns = process.env.AI_VOICE_MAX_TURNS || 30,
         maxDeepToolCalls = process.env.AI_VOICE_MAX_DEEP_CALLS || 10,
         maxTokens = process.env.AI_VOICE_MAX_TOKENS || 50000,
@@ -237,7 +241,6 @@ class RealtimeVoiceBridge {
         this.streamPath = streamPath;
         this.openAiUrl = normalizeOpenAiRealtimeUrl(openAiUrl);
         this.maxSessions = asInteger(maxSessions, 5, 1, 100);
-        this.maxDurationMs = asInteger(maxDurationMs, 10 * 60 * 1000, 30 * 1000, 60 * 60 * 1000);
         this.maxTurns = asInteger(maxTurns, 30, 1, 1000);
         this.maxDeepToolCalls = asInteger(maxDeepToolCalls, 10, 1, 100);
         this.maxTokens = asInteger(maxTokens, 50000, 1000, 1000000);
@@ -363,7 +366,6 @@ class RealtimeVoiceBridge {
             idlePromptCount: 0,
             finished: false,
             startTimer: null,
-            durationTimer: null,
             openAiTimer: null,
             sessionReadyTimer: null,
             heartbeatTimer: null,
@@ -490,13 +492,6 @@ class RealtimeVoiceBridge {
         this.pendingStates.delete(state);
         this.sessions.set(callSid, state);
         this.activeByUser.set(state.safetyIdentifier, callSid);
-        state.durationTimer = setTimeout(() => this.finish(state, {
-            code: 1000,
-            reason: 'session limit',
-            closeTwilio: true,
-            closeOpenAi: true
-        }), this.maxDurationMs);
-        state.durationTimer.unref?.();
         this.openOpenAiSocket(state);
     }
 
@@ -1150,7 +1145,10 @@ class RealtimeVoiceBridge {
                 if (!this.sendDeepToolOutput(
                     state,
                     call,
-                    'Skipped because another deeper analysis is already in progress.'
+                    JSON.stringify({
+                        answer: 'Skipped because another deeper analysis is already in progress.',
+                        searched: false
+                    })
                 )) {
                     this.finish(state, { code: 1011, reason: 'AI backpressure', closeTwilio: true, closeOpenAi: true });
                 }
@@ -1195,6 +1193,7 @@ class RealtimeVoiceBridge {
 
         state.deepToolCalls += 1;
         let answer;
+        let searched = false;
         if (state.deepToolCalls > this.maxDeepToolCalls) {
             answer = 'The deeper-analysis limit for this call has been reached. I can still answer a simpler question directly.';
         } else {
@@ -1209,6 +1208,7 @@ class RealtimeVoiceBridge {
                 });
                 if (result && typeof result === 'object') {
                     answer = String(result.answer || '');
+                    searched = Boolean(result.searched);
                     state.totalTokens += Math.max(0, Number(result.usageTokens || 0));
                 } else {
                     answer = String(result || '');
@@ -1238,7 +1238,10 @@ class RealtimeVoiceBridge {
         if (!this.sendDeepToolOutput(
             state,
             call,
-            stale ? 'Cancelled because the caller started a newer question.' : answer
+            JSON.stringify({
+                answer: stale ? 'Cancelled because the caller started a newer question.' : answer,
+                searched: stale ? false : searched
+            })
         )) {
             this.finish(state, { code: 1011, reason: 'AI backpressure', closeTwilio: true, closeOpenAi: true });
             return;
@@ -1286,7 +1289,6 @@ class RealtimeVoiceBridge {
         this.persistVoiceMemory(state);
         this.pendingStates.delete(state);
         clearTimeout(state.startTimer);
-        clearTimeout(state.durationTimer);
         clearTimeout(state.openAiTimer);
         clearTimeout(state.sessionReadyTimer);
         clearInterval(state.heartbeatTimer);

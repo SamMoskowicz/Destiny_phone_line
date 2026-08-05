@@ -49,3 +49,13 @@ test('long Unicode answers fit three UCS-2 segments without splitting a surrogat
         /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
     );
 });
+
+test('long search answers keep a complete clickable source URL when clipped', () => {
+    const sourceUrl = 'https://example.com/current-information';
+    const message = formatAiSms(`${'Current detail. '.repeat(100)}\n\nSources:\n${sourceUrl}`);
+
+    assert.ok(smsMetrics(message).segments <= 3);
+    assert.match(message, /Current detail/);
+    assert.ok(message.includes(`Sources:\n${sourceUrl}`));
+    assert.ok(message.endsWith(SMS_SUFFIX));
+});

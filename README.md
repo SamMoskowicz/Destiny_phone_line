@@ -67,10 +67,14 @@ If you use Twilio:
 Voice and SMS use different paths so each can meet its own latency target:
 
 - **Normal voice turns:** Twilio's bidirectional Media Stream passes 8 kHz PCMU audio directly to `gpt-realtime-2.1`. OpenAI performs speech understanding, optional `gpt-transcribe` transcription, reasoning, and speech generation. No ffmpeg conversion is needed.
-- **Difficult voice turns:** the Realtime model can call a read-only `answer_complex_question` tool backed by `gpt-5.6-sol`, low reasoning, Fast mode, and a 3.5-second server timeout. The Realtime model then speaks that answer.
-- **SMS:** `gpt-5.6-sol` uses low reasoning and Fast mode with a 4.5-second timeout. The same protected caller memory used by voice provides follow-up context.
+- **Difficult or current voice turns:** the Realtime model calls a read-only `answer_complex_question` tool backed by `gpt-5.6-sol`, low reasoning, Fast mode, and a 10-second server timeout. That Responses API request can automatically use OpenAI's hosted web search before the Realtime model speaks the answer.
+- **SMS:** `gpt-5.6-sol` uses low reasoning and Fast mode with a 12-second timeout. It can automatically search for explicit lookups and current, changing, niche, or uncertain facts, and a searched SMS keeps a clickable source URL. The same protected caller memory used by voice provides follow-up context.
 
-Those are aggressive latency-oriented defaults, not a hard end-to-end guarantee: carrier delay, Twilio, OpenAI load, and the length of the answer also affect timing. Easy spoken turns avoid the second model call and should be the quickest. Fast mode is deliberately enabled because the requested priority is intelligence within a few seconds; set `OPENAI_FAST_MODE=false` to reduce API cost at the expense of latency.
+Web search uses the Responses API's hosted `web_search` tool with a low search-context size and at most two tool calls per answer. Explicit lookups and clearly time-sensitive questions force the search tool and fail closed if no search call is returned; other potentially changing or uncertain questions let the model choose it automatically. The model skips it for ordinary conversation and stable questions it can answer confidently. Search is enabled by default and uses the existing `OPENAI_API_KEY`; no separate search provider or browser key is needed. Set `OPENAI_WEB_SEARCH_ENABLED=false` to turn it off. Hosted searches add OpenAI tool-call cost and may take longer than answers from model knowledge alone; see the [OpenAI web search guide](https://developers.openai.com/api/docs/guides/tools-web-search).
+
+Search-enabled requests still contain the caller's current question and relevant conversation context. The instructions prohibit putting phone numbers, credentials, secrets, or private caller-memory details into search queries and treat retrieved pages as untrusted evidence, but that prompt is a guardrail rather than a hard data-loss boundary. Disable web search if the deployment's privacy policy does not permit live retrieval. In particular, OpenAI documents live Web Search as not HIPAA/BAA eligible; see [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data#web-search).
+
+The timeouts are upper bounds, not a hard end-to-end guarantee: carrier delay, Twilio, OpenAI load, web search, and the length of the answer also affect timing. Easy spoken turns avoid the second model call and should be the quickest. Fast mode is deliberately enabled because the requested priority is intelligence within a few seconds; set `OPENAI_FAST_MODE=false` to reduce API cost at the expense of latency.
 
 When persistent memory is enabled and available, every successful SMS and AI voice exchange updates memory automatically. There is no `AGREE` prompt, recurring notice, or separate consent step. If memory is disabled, SMS chat remains ephemeral. If memory is enabled but unavailable, AI chat fails closed until storage is healthy.
 
@@ -88,7 +92,7 @@ Caller profiles have no automatic time-based expiration. They remain until the c
 
 The memory file is encrypted with AES-256-GCM using `AI_MEMORY_ENCRYPTION_KEY` and contains the HMAC-based caller identifier rather than the raw phone number. Rotating either that encryption key or `AI_SAFETY_SALT` makes existing memory unreadable or unreachable. Keep both secrets stable and backed up securely.
 
-Pressing 8 during an active AI voice chat closes the Media Stream and returns to the main menu. Voice sessions are limited to 10 minutes and 30 turns by default, and repeated silence also ends a call.
+Pressing 8 during an active AI voice chat closes the Media Stream and returns to the main menu. The application does not impose a wall-clock duration limit. Voice sessions are limited to 30 turns by default, and repeated silence also ends a call. The upstream OpenAI Realtime service can still impose its own maximum session duration.
 
 All model traffic uses the official OpenAI API endpoints. The key-bearing endpoints are pinned to OpenAI rather than being configurable through `OPENAI_BASE_URL` or a Realtime URL override.
 
@@ -146,8 +150,9 @@ curl -X POST "${RENDER_URL}/admin/stream/recording" \
 - OPENAI_TEXT_MODEL / OPENAI_DEEP_VOICE_MODEL: both default to `gpt-5.6-sol`
 - OPENAI_TEXT_REASONING / OPENAI_DEEP_VOICE_REASONING: default to `low`
 - OPENAI_FAST_MODE: defaults to `true`; uses OpenAI Fast mode for GPT-5.6 calls
-- OPENAI_TEXT_TIMEOUT_MS / OPENAI_DEEP_VOICE_TIMEOUT_MS: default to 4500 / 3500
-- AI_VOICE_MAX_SESSIONS, AI_VOICE_MAX_DURATION_MS, AI_VOICE_MAX_TURNS, AI_VOICE_MAX_DEEP_CALLS, AI_VOICE_MAX_TOKENS, AI_VOICE_MAX_CONTINUATIONS, AI_VOICE_MAX_IDLE_PROMPTS: voice spend, completion, silence, and concurrency controls
+- OPENAI_WEB_SEARCH_ENABLED: defaults to `true`; offers hosted web search to SMS and deep voice requests, forcing it for clear lookups/time-sensitive questions and using automatic selection otherwise; set to `false` to disable it
+- OPENAI_TEXT_TIMEOUT_MS / OPENAI_DEEP_VOICE_TIMEOUT_MS: default to 12000 / 10000 to allow search-backed answers to finish
+- AI_VOICE_MAX_SESSIONS, AI_VOICE_MAX_TURNS, AI_VOICE_MAX_DEEP_CALLS, AI_VOICE_MAX_TOKENS, AI_VOICE_MAX_CONTINUATIONS, AI_VOICE_MAX_IDLE_PROMPTS: voice spend, completion, silence, and concurrency controls
 - AI_SMS_PER_MINUTE, AI_SMS_PER_DAY, AI_SMS_GLOBAL_PER_HOUR, AI_SMS_GLOBAL_PER_DAY, AI_SMS_MAX_CONCURRENT: model-call abuse/spend controls
 - AI_SMS_OUTBOUND_SEGMENTS_PER_HOUR / AI_SMS_OUTBOUND_SEGMENTS_PER_DAY: carrier-spend limits; each AI answer is also capped at three GSM-7 or UCS-2 segments
 

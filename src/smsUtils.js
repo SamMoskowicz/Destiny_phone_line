@@ -44,9 +44,30 @@ function formatAiSms(answer, { maxSegments = 3 } = {}) {
         return complete;
     }
 
-    const characters = Array.from(body);
-    for (let length = characters.length; length >= 0; length -= 1) {
-        let clipped = characters.slice(0, length).join('').trimEnd();
+    const sourceMarker = '\n\nSources:\n';
+    const sourceIndex = body.lastIndexOf(sourceMarker);
+    const sourceFooter = sourceIndex >= 0 ? body.slice(sourceIndex + 2) : '';
+    const answerBody = sourceFooter ? body.slice(0, sourceIndex).trimEnd() : body;
+    const characters = Array.from(answerBody);
+
+    // Keep a complete, clickable search citation when shortening the prose.
+    if (sourceFooter && smsMetrics(`${prefix}...\n\n${sourceFooter}${suffix}`).segments <= segmentLimit) {
+        for (let length = characters.length; length >= 0; length -= 1) {
+            let clipped = characters.slice(0, length).join('').trimEnd();
+            const lastWhitespace = Math.max(clipped.lastIndexOf(' '), clipped.lastIndexOf('\n'));
+            if (lastWhitespace >= Math.floor(clipped.length * 0.7)) {
+                clipped = clipped.slice(0, lastWhitespace).trimEnd();
+            }
+            const candidate = `${prefix}${clipped}...\n\n${sourceFooter}${suffix}`;
+            if (smsMetrics(candidate).segments <= segmentLimit) {
+                return candidate;
+            }
+        }
+    }
+
+    const fallbackCharacters = Array.from(body);
+    for (let length = fallbackCharacters.length; length >= 0; length -= 1) {
+        let clipped = fallbackCharacters.slice(0, length).join('').trimEnd();
         const lastWhitespace = Math.max(clipped.lastIndexOf(' '), clipped.lastIndexOf('\n'));
         if (lastWhitespace >= Math.floor(clipped.length * 0.7)) {
             clipped = clipped.slice(0, lastWhitespace).trimEnd();

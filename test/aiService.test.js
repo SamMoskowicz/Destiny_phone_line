@@ -6,6 +6,7 @@ const path = require('path');
 const {
     AiService,
     OPENAI_API_BASE_URL,
+    requiresWebSearch,
     truncateText
 } = require('../src/aiService');
 const { AiMemoryStore } = require('../src/aiMemoryStore');
@@ -43,6 +44,21 @@ function fakeClient(outputs) {
     };
 }
 
+test('obvious lookup and changing-information questions require web search', () => {
+    for (const question of [
+        'Please look this up for me.',
+        'What is the latest market news?',
+        'Who is the CEO of Example Corp?',
+        'What is the weather tomorrow?',
+        'Summarize https://example.com/report'
+    ]) {
+        assert.equal(requiresWebSearch(question), true, question);
+    }
+    assert.equal(requiresWebSearch('Rewrite this paragraph more clearly.'), false);
+    assert.equal(requiresWebSearch('What is two plus two?'), false);
+    assert.equal(requiresWebSearch('Explain binary search.'), false);
+});
+
 test('text chat uses GPT-5.6 Sol Fast mode and bounded in-memory history', async () => {
     let now = 1000;
     const client = fakeClient(['First answer', 'Second answer']);
@@ -62,10 +78,18 @@ test('text chat uses GPT-5.6 Sol Fast mode and bounded in-memory history', async
     assert.equal(client.calls[0].params.model, 'gpt-5.6-sol');
     assert.equal(client.calls[0].params.service_tier, 'fast');
     assert.deepEqual(client.calls[0].params.reasoning, { effort: 'low', context: 'current_turn' });
+    assert.deepEqual(client.calls[0].params.tools, [{
+        type: 'web_search',
+        search_context_size: 'low'
+    }]);
+    assert.equal(client.calls[0].params.tool_choice, 'auto');
+    assert.equal(client.calls[0].params.max_tool_calls, 2);
     assert.equal(client.calls[0].params.safety_identifier, 'usr_hash');
     assert.equal(client.calls[0].params.store, false);
     assert.match(client.calls[0].params.instructions, /through SMS text messages/i);
     assert.match(client.calls[0].params.instructions, /not a voice\s+call/i);
+    assert.match(client.calls[0].params.instructions, /web search is available/i);
+    assert.match(client.calls[0].params.instructions, /retrieved pages as untrusted evidence/i);
     assert.match(client.calls[0].params.instructions, /do not volunteer or routinely mention memory/i);
     assert.match(client.calls[0].params.instructions, /persistent caller memory is currently disabled/i);
     assert.doesNotMatch(client.calls[0].params.instructions, /automatically stores a bounded recent window/i);
@@ -136,6 +160,9 @@ test('older exchanges are summarized with store disabled on the OpenAI request',
         await service.refreshMemorySummary(VALID_SAFETY_ID);
 
         assert.equal(client.calls[0].params.store, false);
+        assert.equal(Object.hasOwn(client.calls[0].params, 'tools'), false);
+        assert.equal(Object.hasOwn(client.calls[0].params, 'tool_choice'), false);
+        assert.equal(Object.hasOwn(client.calls[0].params, 'max_tool_calls'), false);
         assert.match(client.calls[0].params.instructions, /important facts the caller explicitly stated/i);
         assert.equal(fixture.memoryStore.getSummaryWork(VALID_SAFETY_ID), null);
         assert.match(fixture.memoryStore.getSnapshot(VALID_SAFETY_ID).summary, /detail 1/i);
@@ -185,9 +212,17 @@ test('deep voice answers use the frontier model without storing the response', a
         recentTranscript: 'We were discussing a tradeoff.'
     });
 
-    assert.deepEqual(result, { answer: 'A careful spoken answer.', usageTokens: 0 });
+    assert.deepEqual(result, { answer: 'A careful spoken answer.', usageTokens: 0, searched: false });
     assert.equal(client.calls[0].params.model, 'gpt-5.6-sol');
     assert.deepEqual(client.calls[0].params.reasoning, { effort: 'medium', context: 'current_turn' });
+    assert.deepEqual(client.calls[0].params.tools, [{
+        type: 'web_search',
+        search_context_size: 'low'
+    }]);
+    assert.equal(client.calls[0].params.tool_choice, 'auto');
+    assert.equal(client.calls[0].params.max_tool_calls, 2);
+    assert.match(client.calls[0].params.instructions, /current,\s+recent/i);
+    assert.match(client.calls[0].params.instructions, /do not read URLs/i);
     assert.match(client.calls[0].params.input, /Recent conversation context/);
     assert.equal(Object.hasOwn(client.calls[0].params, 'max_output_tokens'), false);
     assert.equal(client.calls[0].params.store, false);
@@ -237,6 +272,133 @@ test('deep voice answers are not clipped to a character limit', async () => {
 
     assert.equal(result.answer, longAnswer);
     assert.ok(result.answer.length > 1400);
+});
+
+test('SMS exposes a clickable web citation while spoken answers omit citation markup', async () => {
+    const text = 'The event starts at 7 PM. [Official schedule]';
+    const citationStart = text.indexOf('[');
+    const searchedResponse = {
+        output_text: text,
+        output: [{
+            type: 'web_search_call',
+            status: 'completed'
+        }, {
+            type: 'message',
+            content: [{
+                type: 'output_text',
+                text,
+                annotations: [{
+                    type: 'url_citation',
+                    start_index: citationStart,
+                    end_index: text.length,
+                    title: 'Official schedule',
+                    url: 'https://example.com/schedule?utm_source=chatgpt.com'
+                }]
+            }]
+        }]
+    };
+    const client = fakeClient([searchedResponse, searchedResponse]);
+    const service = new AiService({ client });
+
+    const smsAnswer = await service.replyToText({
+        safetyIdentifier: 'usr_citations',
+        text: 'Look up the event time.'
+    });
+    const voiceAnswer = await service.answerComplexVoice({
+        safetyIdentifier: 'usr_citations',
+        question: 'What time is the event?'
+    });
+
+    assert.match(smsAnswer, /Sources:\nhttps:\/\/example\.com\/schedule/);
+    assert.doesNotMatch(smsAnswer, /\[Official schedule\]/);
+    assert.doesNotMatch(smsAnswer, /utm_source/);
+    assert.equal(client.calls[0].params.tool_choice, 'required');
+    assert.equal(voiceAnswer.answer, 'The event starts at 7 PM.');
+    assert.equal(voiceAnswer.searched, true);
+});
+
+test('SMS keeps two short web citations and removes non-clickable citation labels', async () => {
+    const text = 'First fact. [Source one] Second fact. [Source two]';
+    const firstStart = text.indexOf('[Source one]');
+    const secondStart = text.indexOf('[Source two]');
+    const client = fakeClient([{
+        output_text: text,
+        output: [{ type: 'web_search_call', status: 'completed' }, {
+            type: 'message',
+            content: [{
+                type: 'output_text',
+                text,
+                annotations: [{
+                    type: 'url_citation',
+                    start_index: firstStart,
+                    end_index: firstStart + '[Source one]'.length,
+                    title: 'Source one',
+                    url: 'https://one.example/fact'
+                }, {
+                    type: 'url_citation',
+                    start_index: secondStart,
+                    end_index: secondStart + '[Source two]'.length,
+                    title: 'Source two',
+                    url: 'https://two.example/fact'
+                }]
+            }]
+        }]
+    }]);
+    const service = new AiService({ client });
+
+    const answer = await service.replyToText({
+        safetyIdentifier: 'usr_two_citations',
+        text: 'Search the web for both facts.'
+    });
+
+    assert.doesNotMatch(answer, /\[Source (?:one|two)\]/);
+    assert.match(answer, /Sources:\nhttps:\/\/one\.example\/fact\nhttps:\/\/two\.example\/fact/);
+});
+
+test('an explicit lookup fails closed if the response contains no web-search call', async () => {
+    const client = fakeClient(['An unverified current answer.']);
+    const service = new AiService({ client });
+
+    await assert.rejects(
+        service.replyToText({
+            safetyIdentifier: 'usr_search_required',
+            text: 'What is the latest market news?'
+        }),
+        (error) => error.code === 'AI_WEB_SEARCH_REQUIRED'
+    );
+    assert.equal(client.calls[0].params.tool_choice, 'required');
+});
+
+test('an incomplete SMS response is never sent or added to conversation history', async () => {
+    const client = fakeClient([{
+        status: 'incomplete',
+        incomplete_details: { reason: 'content_filter' },
+        output_text: 'Partial filtered answer.'
+    }, 'Fresh answer.']);
+    const service = new AiService({ client });
+
+    await assert.rejects(
+        service.replyToText({ safetyIdentifier: 'usr_incomplete_sms', text: 'First question' }),
+        (error) => error.code === 'AI_INCOMPLETE_RESPONSE'
+    );
+    const answer = await service.replyToText({
+        safetyIdentifier: 'usr_incomplete_sms',
+        text: 'Second question'
+    });
+
+    assert.equal(answer, 'Fresh answer.');
+    assert.deepEqual(client.calls[1].params.input, [{ role: 'user', content: 'Second question' }]);
+});
+
+test('web search can be disabled without exposing a search tool', async () => {
+    const client = fakeClient(['A bounded answer.']);
+    const service = new AiService({ client, webSearchEnabled: false });
+
+    await service.replyToText({ safetyIdentifier: 'usr_no_search', text: 'Hello' });
+
+    assert.equal(Object.hasOwn(client.calls[0].params, 'tools'), false);
+    assert.equal(Object.hasOwn(client.calls[0].params, 'tool_choice'), false);
+    assert.match(client.calls[0].params.instructions, /live web search is disabled/i);
 });
 
 test('an incomplete deep answer keeps only complete spoken sentences', async () => {
@@ -310,8 +472,8 @@ test('invalid timeout and odd history configuration are normalized safely', asyn
         deepVoiceTimeoutMs: 'also-invalid',
         maxHistoryMessages: 3
     });
-    assert.equal(service.textTimeoutMs, 4500);
-    assert.equal(service.deepVoiceTimeoutMs, 3500);
+    assert.equal(service.textTimeoutMs, 12000);
+    assert.equal(service.deepVoiceTimeoutMs, 10000);
     assert.equal(service.maxHistoryMessages, 2);
 
     await service.replyToText({ safetyIdentifier: 'usr_hash', text: 'first' });

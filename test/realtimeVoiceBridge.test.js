@@ -65,6 +65,7 @@ function createHarness({
     clock = () => Date.now(),
     answer = 'Deep answer.',
     deepUsageTokens = 0,
+    searched = false,
     memoryContext = '',
     memoryGeneration = 0,
     persistentMemory = true,
@@ -94,7 +95,7 @@ function createHarness({
         async answerComplexVoice(args) {
             aiService.calls.push(args);
             aiService.lastArgs = args;
-            return { answer, usageTokens: deepUsageTokens };
+            return { answer, usageTokens: deepUsageTokens, searched };
         }
     };
     const bridge = new RealtimeVoiceBridge({
@@ -148,6 +149,10 @@ test('session update configures PCMU, transcription, VAD, reasoning, and the dee
     assert.deepEqual(event.session.reasoning, { effort: 'low' });
     assert.equal(event.session.max_output_tokens, 'inf');
     assert.equal(event.session.tools[0].name, 'answer_complex_question');
+    assert.match(event.session.tools[0].description, /any question needing web search/i);
+    assert.match(event.session.instructions, /answer depends on current, recent/i);
+    assert.match(event.session.instructions, /never answer those questions from memory/i);
+    assert.match(event.session.instructions, /speak only their answer field/i);
     assert.match(event.session.instructions, /do not volunteer or routinely mention memory/i);
     assert.match(event.session.instructions, /persistent caller memory is currently disabled/i);
 });
@@ -186,6 +191,21 @@ test('accepted Realtime setup requests one short proactive audio greeting', () =
     assert.equal(upstream.sent.filter((event) => (
         event.response?.metadata?.response_purpose === 'initial_greeting'
     )).length, 1);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('active voice sessions do not install an application duration timer', () => {
+    const { bridge, upstream, twilioSocket, state } = createHarness({
+        // A legacy deployment value must no longer restore the removed cutoff.
+        bridgeOptions: { maxDurationMs: 30 * 1000 }
+    });
+    completeSetup(upstream);
+
+    assert.equal(Object.hasOwn(bridge, 'maxDurationMs'), false);
+    assert.equal(Object.hasOwn(state, 'durationTimer'), false);
+    assert.equal(state.finished, false);
 
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     bridge.close();
@@ -965,7 +985,8 @@ test('barge-in truncation follows Twilio stream timestamps instead of server wal
 test('difficult-question tool results and usage are returned to Realtime', async () => {
     const { bridge, upstream, twilioSocket, aiService, state } = createHarness({
         answer: 'Use the second approach.',
-        deepUsageTokens: 30
+        deepUsageTokens: 30,
+        searched: true
     });
     completeSetup(upstream);
     upstream.receive({
@@ -1005,7 +1026,7 @@ test('difficult-question tool results and usage are returned to Realtime', async
         item: {
             type: 'function_call_output',
             call_id: 'call-1',
-            output: 'Use the second approach.'
+            output: JSON.stringify({ answer: 'Use the second approach.', searched: true })
         }
     });
     assert.ok(disableIndex >= 0 && disableIndex < functionOutputIndex);
@@ -1050,7 +1071,10 @@ test('a second function call gets an immediate output while only one deep reques
         item: {
             type: 'function_call_output',
             call_id: 'call-second',
-            output: 'Skipped because another deeper analysis is already in progress.'
+            output: JSON.stringify({
+                answer: 'Skipped because another deeper analysis is already in progress.',
+                searched: false
+            })
         }
     });
     assert.equal(aiService.calls.length, 1);
@@ -1059,7 +1083,7 @@ test('a second function call gets an immediate output while only one deep reques
     assert.equal(aiService.calls.length, 1);
     assert.equal(
         upstream.sent.find((event) => event.item?.call_id === 'call-first')?.item?.output,
-        'The first deep answer.'
+        JSON.stringify({ answer: 'The first deep answer.', searched: false })
     );
 
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
@@ -1142,12 +1166,17 @@ test('a stale deep result is cancelled before the newer caller turn is answered'
         item: {
             type: 'function_call_output',
             call_id: 'call-old',
-            output: 'Cancelled because the caller started a newer question.'
+            output: JSON.stringify({
+                answer: 'Cancelled because the caller started a newer question.',
+                searched: false
+            })
         }
     });
     assert.ok(enableIndex > cancellationIndex);
     assert.ok(responseIndex > enableIndex);
-    assert.equal(upstream.sent.some((event) => event.item?.output === 'This stale answer must not be spoken.'), false);
+    assert.equal(upstream.sent.some((event) => (
+        String(event.item?.output || '').includes('This stale answer must not be spoken.')
+    )), false);
 
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     bridge.close();
