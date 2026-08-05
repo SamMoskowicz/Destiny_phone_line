@@ -9,3 +9,11 @@ const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')],
 child.on('exit', (code) => {
     process.exit(code || 0);
 });
+
+for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.on(signal, () => {
+        if (!child.killed) {
+            child.kill(signal);
+        }
+    });
+}

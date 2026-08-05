@@ -12,6 +12,7 @@ test('menu announces live status and lists the other options', () => {
     assert.match(service.getMenuPrompt(), /no live stream/i);
     assert.match(service.getMenuPrompt(), /2 through 6/i);
     assert.match(service.getMenuPrompt(), /press 7/i);
+    assert.match(service.getMenuPrompt(), /press 8.*AI assistant/i);
 
     service.startStream();
     assert.match(service.getMenuPrompt(), /press 1/i);
@@ -106,6 +107,22 @@ test('builds a TwiML menu response for Destiny', () => {
     assert.match(twiml, /<Response>/);
     assert.match(twiml, /action="\/voice\/menu"/);
     assert.match(twiml, /Destiny/);
+
+    if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+    }
+});
+
+test('builds bidirectional AI Stream TwiML with disclosure and escaped attributes', () => {
+    const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
+    const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+
+    const twiml = service.buildAiStreamTwiML('wss://example.com/voice/ai-stream?x=1&y=2', 'token"value');
+    assert.match(twiml, /<Connect>/);
+    assert.match(twiml, /<Stream url="wss:\/\/example\.com\/voice\/ai-stream\?x=1&amp;y=2">/);
+    assert.match(twiml, /name="sessionToken" value="token&quot;value"/);
+    assert.match(twiml, /powered by OpenAI/i);
+    assert.match(twiml, /<Redirect method="POST">\/voice\/menu<\/Redirect>/);
 
     if (fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);

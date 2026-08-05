@@ -27,6 +27,12 @@ function escapeXml(value) {
         .replace(/>/g, '&gt;');
 }
 
+function escapeXmlAttribute(value) {
+    return escapeXml(value)
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
 const ANNOUNCEMENT_TIME_ZONE = 'America/New_York';
 
 // Fixed to a single timezone (not each caller's own) since there's no
@@ -83,7 +89,7 @@ class PhoneService {
         const liveLine = this.state.isLive
             ? `To hear Destiny's live stream, press 1.`
             : `There is no live stream right now.`;
-        return `${liveLine} Press 2 through 6 for the last five archived streams, from most recent to oldest. Press 7 to hear the playback controls.`;
+        return `${liveLine} Press 2 through 6 for the last five archived streams, from most recent to oldest. Press 7 to hear the playback controls. Press 8 to talk with the AI assistant.`;
     }
 
     getControlsInfoPrompt() {
@@ -104,6 +110,10 @@ class PhoneService {
     buildControlsInfoTwiML() {
         const menuPrompt = escapeXml(this.getMenuPrompt());
         return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${escapeXml(this.getControlsInfoPrompt())}</Say>\n  <Pause length="1"/>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${menuPrompt}</Say>\n  </Gather>\n  <Say voice="alice">${menuPrompt}</Say>\n</Response>`;
+    }
+
+    buildAiStreamTwiML(webSocketUrl, sessionToken) {
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">You are now speaking with an AI assistant powered by OpenAI. Audio and a transcript are processed to answer you. You can start speaking now, or press 8 to return to the main menu.</Say>\n  <Connect>\n    <Stream url="${escapeXmlAttribute(webSocketUrl)}">\n      <Parameter name="sessionToken" value="${escapeXmlAttribute(sessionToken)}"/>\n    </Stream>\n  </Connect>\n  <Redirect method="POST">/voice/menu</Redirect>\n</Response>`;
     }
 
     buildPlaybackTwiML(prompt, audioUrl = null) {
@@ -394,4 +404,4 @@ class PhoneService {
     }
 }
 
-module.exports = { PhoneService, createDefaultState };
+module.exports = { PhoneService, createDefaultState, escapeXml, escapeXmlAttribute };

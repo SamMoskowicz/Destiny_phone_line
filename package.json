@@ -12,9 +12,12 @@
     },
     "dependencies": {
         "@ffmpeg-installer/ffmpeg": "^1.1.0",
+        "openai": "^7.4.0",
         "puppeteer": "^25.4.0",
         "puppeteer-extra": "^3.3.6",
-        "puppeteer-extra-plugin-stealth": "^2.11.2"
+        "puppeteer-extra-plugin-stealth": "^2.11.2",
+        "twilio": "^6.0.2",
+        "ws": "^8.21.2"
     },
     "allowScripts": {
         "puppeteer@25.4.0": true

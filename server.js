@@ -2,7 +2,18 @@ const http = require('http');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
-const { PhoneService } = require('./src/phoneService');
+const { PhoneService, escapeXml } = require('./src/phoneService');
+const { AiService } = require('./src/aiService');
+const {
+    createSafetyIdentifier,
+    DualWindowRateLimiter,
+    ExpiringIdempotencyCache,
+    EphemeralSessionTokenStore
+} = require('./src/aiSecurity');
+const { TwilioSecurity, normalizeBaseUrl } = require('./src/twilioSecurity');
+const { RealtimeVoiceBridge } = require('./src/realtimeVoiceBridge');
+const { ConsentStore } = require('./src/consentStore');
+const { formatAiSms, smsMetrics } = require('./src/smsUtils');
 const kickBrowser = require('./src/kickBrowser');
 const hlsFetch = require('./src/hlsFetch');
 
@@ -13,6 +24,58 @@ const FFMPEG_PATH = process.env.FFMPEG_PATH || ffmpegInstaller.path;
 const service = new PhoneService({
     streamerName: process.env.STREAMER_NAME || 'Destiny',
     storageFile: process.env.PHONE_SERVICE_STATE_FILE || undefined
+});
+
+// Messages, transcripts, and audio are never written to disk. Only HMAC-based
+// opt-out identifiers are persisted so consent survives process restarts.
+const AI_SAFETY_SALT_CONFIGURED = Boolean(String(process.env.AI_SAFETY_SALT || '').trim());
+const AI_SAFETY_SALT = process.env.AI_SAFETY_SALT || 'ai-disabled-without-stable-salt';
+const aiService = new AiService();
+const twilioSecurity = new TwilioSecurity();
+const consentStore = new ConsentStore();
+const aiSessionTokens = new EphemeralSessionTokenStore();
+const smsIdempotency = new ExpiringIdempotencyCache();
+const smsUserLimiter = new DualWindowRateLimiter({
+    shortLimit: Number(process.env.AI_SMS_PER_MINUTE || 3),
+    shortWindowMs: 60 * 1000,
+    longLimit: Number(process.env.AI_SMS_PER_DAY || 20)
+});
+const smsGlobalLimiter = new DualWindowRateLimiter({
+    shortLimit: Number(process.env.AI_SMS_GLOBAL_PER_HOUR || 500),
+    shortWindowMs: 60 * 60 * 1000,
+    longLimit: Number(process.env.AI_SMS_GLOBAL_PER_DAY || 5000)
+});
+const smsNoticeLimiter = new DualWindowRateLimiter({
+    shortLimit: 1,
+    shortWindowMs: 60 * 60 * 1000,
+    longLimit: 3,
+    longWindowMs: 24 * 60 * 60 * 1000
+});
+const smsOutboundLimiter = new DualWindowRateLimiter({
+    shortLimit: Number(process.env.AI_SMS_OUTBOUND_SEGMENTS_PER_HOUR || 1500),
+    shortWindowMs: 60 * 60 * 1000,
+    longLimit: Number(process.env.AI_SMS_OUTBOUND_SEGMENTS_PER_DAY || 10000),
+    longWindowMs: 24 * 60 * 60 * 1000
+});
+const smsDeliveryGuard = new DualWindowRateLimiter({
+    shortLimit: 1,
+    shortWindowMs: 24 * 60 * 60 * 1000,
+    longLimit: 1,
+    longWindowMs: 24 * 60 * 60 * 1000,
+    maxKeys: 50000
+});
+const AI_SMS_MAX_CONCURRENT = Math.max(1, Math.min(100, Number(process.env.AI_SMS_MAX_CONCURRENT || 10) || 10));
+let activeSmsAiRequests = 0;
+const voiceStartLimiter = new DualWindowRateLimiter({
+    shortLimit: Number(process.env.AI_VOICE_STARTS_PER_10_MINUTES || 3),
+    shortWindowMs: 10 * 60 * 1000,
+    longLimit: Number(process.env.AI_VOICE_STARTS_PER_DAY || 10)
+});
+const aiVoiceBridge = new RealtimeVoiceBridge({
+    apiKey: AI_SAFETY_SALT_CONFIGURED ? process.env.OPENAI_API_KEY : null,
+    aiService,
+    tokenStore: aiSessionTokens,
+    twilioSecurity
 });
 
 const KICK_CHANNEL = process.env.KICK_CHANNEL || null;
@@ -404,9 +467,9 @@ function attachArchiveResponse(session, res) {
 }
 
 function getRequestBaseUrl(req = null) {
-    const configured = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
+    const configured = normalizeBaseUrl(process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL);
     if (configured) {
-        return configured.replace(/\/+$/, '');
+        return configured;
     }
     if (!req) {
         return null;
@@ -438,7 +501,7 @@ async function pollKickChannel() {
     // repeatedly. Skipping it while someone's live means we won't notice the
     // stream ending mid-call, but the transcode process will exit on its own
     // once the source actually goes away, which its exit handler covers.
-    if (activeLiveRequests.size > 0) {
+    if (activeLiveRequests.size > 0 || aiVoiceBridge.activeSessionCount > 0) {
         return;
     }
     try {
@@ -496,7 +559,7 @@ async function pollKickVideos() {
     // Chrome (Puppeteer) and ffmpeg competing for the same CPU core can stall
     // audio delivery to an actively-listening caller badly enough that Twilio
     // gives up on the stream - defer background archiving until nobody's live.
-    if (activeLiveRequests.size > 0) {
+    if (activeLiveRequests.size > 0 || aiVoiceBridge.activeSessionCount > 0) {
         return;
     }
     if (pollingVideosInProgress) {
@@ -612,38 +675,91 @@ async function resolveRecordingPlayback(recording) {
     return { segments: info.segments };
 }
 
-function parseBody(req) {
+class HttpRequestError extends Error {
+    constructor(message, statusCode) {
+        super(message);
+        this.statusCode = statusCode;
+    }
+}
+
+function parseBody(req, maxBytes = 16 * 1024) {
     return new Promise((resolve, reject) => {
-        let body = '';
+        const declaredLength = Number(req.headers['content-length'] || 0);
+        if (declaredLength > maxBytes) {
+            req.resume();
+            reject(new HttpRequestError('Request body is too large', 413));
+            return;
+        }
+
+        const chunks = [];
+        let bytes = 0;
+        let settled = false;
         req.on('data', (chunk) => {
-            body += chunk.toString();
+            if (settled) {
+                return;
+            }
+            bytes += chunk.length;
+            if (bytes > maxBytes) {
+                settled = true;
+                req.resume();
+                reject(new HttpRequestError('Request body is too large', 413));
+                return;
+            }
+            chunks.push(chunk);
         });
         req.on('end', () => {
-            if (!body) {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            const rawBody = Buffer.concat(chunks).toString('utf8');
+            if (!rawBody) {
                 resolve({});
                 return;
             }
 
-            const parsed = {};
-            body.split('&').forEach((pair) => {
-                const [key, value] = pair.split('=');
-                if (key) {
-                    parsed[decodeURIComponent(key)] = decodeURIComponent(value || '');
-                }
-            });
-
-            if (req.headers['content-type']?.includes('application/json')) {
+            const contentType = String(req.headers['content-type'] || '').toLowerCase();
+            if (contentType.includes('application/json')) {
                 try {
-                    Object.assign(parsed, JSON.parse(body));
+                    const parsed = JSON.parse(rawBody);
+                    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                        throw new Error('JSON body must be an object');
+                    }
+                    resolve(parsed);
                 } catch (error) {
-                    // Ignore malformed JSON and fall back to form parsing.
+                    reject(new HttpRequestError('Malformed JSON body', 400));
                 }
+                return;
             }
 
+            const parsed = {};
+            for (const [key, value] of new URLSearchParams(rawBody)) {
+                if (Object.hasOwn(parsed, key)) {
+                    parsed[key] = Array.isArray(parsed[key])
+                        ? [...parsed[key], value]
+                        : [parsed[key], value];
+                } else {
+                    parsed[key] = value;
+                }
+            }
             resolve(parsed);
         });
-        req.on('error', reject);
+        req.on('error', (error) => {
+            if (!settled) {
+                settled = true;
+                reject(error);
+            }
+        });
     });
+}
+
+function getRequestPath(req) {
+    return new URL(req.url, 'http://localhost').pathname;
+}
+
+function getBodyValue(body, name) {
+    const value = body[name];
+    return Array.isArray(value) ? value[value.length - 1] : value;
 }
 
 function isAuthorizedAdmin(req) {
@@ -661,11 +777,165 @@ function sendTwiml(res, body) {
     res.end(body);
 }
 
-function handleVoiceRequest(req, res, body) {
-    const phoneNumber = body.From || body.phoneNumber || 'unknown-caller';
-    const digits = body.Digits || body.digits || '';
+function buildSmsTwiML(message = null) {
+    const messageXml = message === null ? '' : `<Message>${escapeXml(message)}</Message>`;
+    return `<?xml version="1.0" encoding="UTF-8"?><Response>${messageXml}</Response>`;
+}
 
-    if (req.url === '/voice/live-continue') {
+function sendSmsReply(res, messageSid, message = null) {
+    if (message === null || !messageSid) {
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (!smsDeliveryGuard.consume(messageSid).allowed) {
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    const segmentCount = smsMetrics(message).segments;
+    for (let index = 0; index < segmentCount; index += 1) {
+        if (!smsOutboundLimiter.consume('global').allowed) {
+            sendTwiml(res, buildSmsTwiML());
+            return;
+        }
+    }
+    sendTwiml(res, buildSmsTwiML(message));
+}
+
+function validateTwilioWebhook(req, res, body, { required = false } = {}) {
+    if (!twilioSecurity.isConfigured()) {
+        if (!required) {
+            return true;
+        }
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end('Twilio authentication is not configured');
+        return false;
+    }
+    if (!twilioSecurity.validateHttpRequest(req, body)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden');
+        return false;
+    }
+    return true;
+}
+
+function buildAiWebSocketUrl(req = null) {
+    const baseUrl = getRequestBaseUrl(req);
+    if (!baseUrl) {
+        return null;
+    }
+    const url = new URL('/voice/ai-stream', `${baseUrl}/`);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+}
+
+async function handleSmsRequest(req, res, body) {
+    if (!validateTwilioWebhook(req, res, body, { required: true })) {
+        return;
+    }
+    const from = String(getBodyValue(body, 'From') || '').trim().slice(0, 64);
+    const messageSid = String(getBodyValue(body, 'MessageSid') || '').trim().slice(0, 128);
+    const text = String(getBodyValue(body, 'Body') || '').trim().slice(0, 1600);
+    const safetyIdentifier = AI_SAFETY_SALT_CONFIGURED && from
+        ? createSafetyIdentifier(from, AI_SAFETY_SALT)
+        : null;
+    const keyword = text.toUpperCase();
+    const optOutType = String(getBodyValue(body, 'OptOutType') || '').toUpperCase();
+    const stopKeywords = new Set(['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT', 'REVOKE', 'OPTOUT']);
+    const startKeywords = new Set(['START', 'UNSTOP']);
+
+    if (optOutType === 'STOP' || stopKeywords.has(keyword)) {
+        if (safetyIdentifier) {
+            aiService.resetTextConversation(safetyIdentifier);
+            consentStore.optOut(safetyIdentifier);
+        }
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (optOutType === 'START' || startKeywords.has(keyword)) {
+        if (safetyIdentifier) {
+            aiService.resetTextConversation(safetyIdentifier);
+            consentStore.optIn(safetyIdentifier);
+        }
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (optOutType === 'HELP') {
+        // Twilio Advanced Opt-Out supplies its own HELP confirmation.
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (['HELP', 'INFO'].includes(keyword)) {
+        if (safetyIdentifier && smsNoticeLimiter.consume(safetyIdentifier).allowed) {
+            sendSmsReply(res, messageSid, 'Destiny AI answers questions sent to this number. Reply STOP to unsubscribe.');
+        } else {
+            sendTwiml(res, buildSmsTwiML());
+        }
+        return;
+    }
+    if (!messageSid || !from) {
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (!safetyIdentifier || consentStore.isOptedOut(safetyIdentifier)) {
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (!text || !aiService.isConfigured()) {
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+
+    let message = null;
+    try {
+        message = await smsIdempotency.run(messageSid, async () => {
+            const userLimit = smsUserLimiter.consume(safetyIdentifier);
+            if (!userLimit.allowed) {
+                return null;
+            }
+            const globalLimit = smsGlobalLimiter.consume('global');
+            if (!globalLimit.allowed) {
+                return null;
+            }
+            if (activeSmsAiRequests >= AI_SMS_MAX_CONCURRENT) {
+                return null;
+            }
+            activeSmsAiRequests += 1;
+            try {
+                const answer = await aiService.replyToText({ safetyIdentifier, text });
+                if (consentStore.isOptedOut(safetyIdentifier)) {
+                    return null;
+                }
+                return formatAiSms(answer, { maxSegments: 3 });
+            } catch (error) {
+                if (error?.code === 'AI_CONVERSATION_RESET') {
+                    return null;
+                }
+                console.warn('[ai-sms] response_failed', { code: String(error?.code || error?.status || 'unknown').slice(0, 80) });
+                return null;
+            } finally {
+                activeSmsAiRequests -= 1;
+            }
+        });
+    } catch (error) {
+        if (error?.code !== 'IDEMPOTENCY_CAPACITY') {
+            throw error;
+        }
+        message = null;
+    }
+    if (consentStore.isOptedOut(safetyIdentifier)) {
+        message = null;
+    }
+    sendSmsReply(res, messageSid, message);
+}
+
+function handleVoiceRequest(req, res, body) {
+    const phoneNumber = getBodyValue(body, 'From') || getBodyValue(body, 'phoneNumber') || 'unknown-caller';
+    const digits = getBodyValue(body, 'Digits') || getBodyValue(body, 'digits') || '';
+    const requestPath = getRequestPath(req);
+
+    if (requestPath === '/voice/live-continue') {
         // Reached when one live chunk finishes and the caller didn't press
         // anything - loop back for the next chunk. Silent (message is null)
         // while still live; gracefully falls back to the menu once it ends.
@@ -674,7 +944,7 @@ function handleVoiceRequest(req, res, body) {
         return;
     }
 
-    if (req.url === '/voice/playback') {
+    if (requestPath === '/voice/playback') {
         const action = service.handlePlaybackControl(phoneNumber, digits);
 
         if (action.type === 'menu') {
@@ -721,15 +991,46 @@ function handleVoiceRequest(req, res, body) {
             sendTwiml(res, service.buildControlsInfoTwiML());
             return;
         }
+
+        if (digits === '8') {
+            const callSid = String(getBodyValue(body, 'CallSid') || '');
+            const webSocketUrl = buildAiWebSocketUrl(req);
+            if (!callSid || !webSocketUrl || !aiVoiceBridge.isConfigured() || !twilioSecurity.hasFixedPublicUrl()) {
+                sendTwiml(res, service.buildMenuTwiML('The AI assistant is not configured yet.'));
+                return;
+            }
+            if (aiVoiceBridge.activeSessionCount >= aiVoiceBridge.maxSessions) {
+                sendTwiml(res, service.buildMenuTwiML('The AI assistant is busy. Please try again shortly.'));
+                return;
+            }
+            const safetyIdentifier = createSafetyIdentifier(phoneNumber, AI_SAFETY_SALT);
+            const limit = voiceStartLimiter.consume(safetyIdentifier);
+            if (!limit.allowed) {
+                sendTwiml(res, service.buildMenuTwiML('The AI call limit has been reached for now.'));
+                return;
+            }
+            const sessionToken = aiSessionTokens.issue({ callSid, safetyIdentifier });
+            sendTwiml(res, service.buildAiStreamTwiML(webSocketUrl, sessionToken));
+            return;
+        }
     }
 
     sendTwiml(res, service.buildMenuTwiML());
 }
 
-const server = http.createServer(async (req, res) => {
-    if (req.url === '/health') {
+async function handleVoiceWebhook(req, res) {
+    const body = await parseBody(req);
+    if (!validateTwilioWebhook(req, res, body)) {
+        return;
+    }
+    handleVoiceRequest(req, res, body);
+}
+
+async function handleHttpRequest(req, res) {
+    const requestPath = getRequestPath(req);
+    if (requestPath === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, streamer: service.streamerName, streamerHandle: 'Destiny' }));
+        res.end(JSON.stringify({ ok: true }));
         return;
     }
 
@@ -1018,27 +1319,37 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (req.method === 'POST' && req.url === '/voice') {
+    if (req.method === 'POST' && requestPath === '/voice') {
+        await handleVoiceWebhook(req, res);
+        return;
+    }
+
+    if (req.method === 'POST' && requestPath === '/voice/menu') {
+        await handleVoiceWebhook(req, res);
+        return;
+    }
+
+    if (req.method === 'POST' && requestPath === '/voice/playback') {
+        await handleVoiceWebhook(req, res);
+        return;
+    }
+
+    if (req.method === 'POST' && requestPath === '/voice/live-continue') {
         const body = await parseBody(req);
+        if (!validateTwilioWebhook(req, res, body)) {
+            return;
+        }
         handleVoiceRequest(req, res, body);
         return;
     }
 
-    if (req.method === 'POST' && req.url === '/voice/menu') {
-        const body = await parseBody(req);
-        handleVoiceRequest(req, res, body);
-        return;
-    }
-
-    if (req.method === 'POST' && req.url === '/voice/playback') {
-        const body = await parseBody(req);
-        handleVoiceRequest(req, res, body);
-        return;
-    }
-
-    if (req.method === 'POST' && req.url === '/voice/live-continue') {
-        const body = await parseBody(req);
-        handleVoiceRequest(req, res, body);
+    if (req.method === 'POST' && requestPath === '/sms') {
+        const contentType = String(req.headers['content-type'] || '').toLowerCase();
+        if (!contentType.includes('application/x-www-form-urlencoded')) {
+            throw new HttpRequestError('SMS webhook requires a form-encoded body', 415);
+        }
+        const body = await parseBody(req, 8 * 1024);
+        await handleSmsRequest(req, res, body);
         return;
     }
 
@@ -1091,43 +1402,81 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'Not found' }));
-});
+}
 
-const port = Number(process.env.PORT || 3000);
-server.listen(port, () => {
-    console.log(`Phone service listening on port ${port}`);
-    console.log(`Streamer configured: ${service.streamerName}`);
-
-    if (KICK_CHANNEL) {
-        console.log(`Auto-detecting live status for Kick channel "${KICK_CHANNEL}" every ${KICK_POLL_INTERVAL_MS}ms`);
-        pollKickChannel();
-        setInterval(pollKickChannel, KICK_POLL_INTERVAL_MS);
-
-        console.log(
-            `Checking for new archived streams every ${KICK_VIDEOS_POLL_MIN_INTERVAL_MS}-`
-            + `${KICK_VIDEOS_POLL_MAX_INTERVAL_MS}ms (randomized)`
-        );
-        pollKickVideos();
-        scheduleNextKickVideosPoll();
-    } else {
-        console.log('KICK_CHANNEL not set - start/stop the live stream manually via POST /admin/stream/live and /admin/stream/stop');
-    }
-
-    // Sweeps archive sessions nobody has reattached to in a while (hangup,
-    // switched recordings, went to the menu) so their ffmpeg process and Kick
-    // CDN connection don't stay open indefinitely.
-    setInterval(() => {
-        const now = Date.now();
-        for (const [phoneNumber, session] of archiveSessions) {
-            if (!session.currentRes && now - session.lastAttachedAt > ARCHIVE_SESSION_IDLE_MS) {
-                stopArchiveSession(phoneNumber);
-            }
+const server = http.createServer((req, res) => {
+    handleHttpRequest(req, res).catch((error) => {
+        if (res.writableEnded) {
+            return;
         }
-    }, 30000);
+        if (res.headersSent) {
+            res.destroy();
+            return;
+        }
+        const statusCode = Number(error?.statusCode) || 500;
+        if (statusCode >= 500) {
+            console.error('[http] request_failed', {
+                code: String(error?.code || error?.name || 'unknown').slice(0, 80)
+            });
+        }
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: false,
+            error: statusCode >= 500 ? 'Internal server error' : error.message
+        }));
+    });
 });
+aiVoiceBridge.attach(server);
+
+function startServer() {
+    const port = Number(process.env.PORT || 3000);
+    server.listen(port, () => {
+        console.log(`Phone service listening on port ${port}`);
+        console.log(`Streamer configured: ${service.streamerName}`);
+        console.log(`AI text chat: ${AI_SAFETY_SALT_CONFIGURED && aiService.isConfigured() && twilioSecurity.isConfigured() ? 'configured' : 'not configured'}`);
+        console.log(`AI voice chat: ${aiVoiceBridge.isConfigured() && twilioSecurity.hasFixedPublicUrl() ? 'configured' : 'not configured'}`);
+        if (!process.env.AI_SAFETY_SALT) {
+            console.warn('AI_SAFETY_SALT is unset; AI text and voice endpoints are disabled.');
+        }
+        if (process.env.NODE_ENV === 'production' && !twilioSecurity.isConfigured()) {
+            console.warn('TWILIO_AUTH_TOKEN is unset; SMS and AI voice endpoints are disabled.');
+        }
+
+        if (KICK_CHANNEL) {
+            console.log(`Auto-detecting live status for Kick channel "${KICK_CHANNEL}" every ${KICK_POLL_INTERVAL_MS}ms`);
+            pollKickChannel();
+            const livePollTimer = setInterval(pollKickChannel, KICK_POLL_INTERVAL_MS);
+            livePollTimer.unref?.();
+
+            console.log(
+                `Checking for new archived streams every ${KICK_VIDEOS_POLL_MIN_INTERVAL_MS}-`
+                + `${KICK_VIDEOS_POLL_MAX_INTERVAL_MS}ms (randomized)`
+            );
+            pollKickVideos();
+            scheduleNextKickVideosPoll();
+        } else {
+            console.log('KICK_CHANNEL not set - start/stop the live stream manually via POST /admin/stream/live and /admin/stream/stop');
+        }
+
+        // Sweeps archive sessions nobody has reattached to in a while (hangup,
+        // switched recordings, went to the menu) so their ffmpeg process and Kick
+        // CDN connection don't stay open indefinitely.
+        const archiveSweepTimer = setInterval(() => {
+            const now = Date.now();
+            for (const [phoneNumber, session] of archiveSessions) {
+                if (!session.currentRes && now - session.lastAttachedAt > ARCHIVE_SESSION_IDLE_MS) {
+                    stopArchiveSession(phoneNumber);
+                }
+            }
+        }, 30000);
+        archiveSweepTimer.unref?.();
+    });
+    return server;
+}
 
 async function shutdown() {
     stopLiveTranscode();
+    aiVoiceBridge.close();
     for (const phoneNumber of Array.from(archiveSessions.keys())) {
         stopArchiveSession(phoneNumber);
     }
@@ -1135,5 +1484,19 @@ async function shutdown() {
     server.close(() => process.exit(0));
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+if (require.main === module) {
+    startServer();
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+}
+
+module.exports = {
+    server,
+    service,
+    startServer,
+    shutdown,
+    parseBody,
+    buildSmsTwiML,
+    buildAiWebSocketUrl,
+    handleHttpRequest
+};
