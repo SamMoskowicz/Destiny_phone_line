@@ -83,7 +83,7 @@ test('text chat uses GPT-5.6 Sol Fast mode and bounded in-memory history', async
         search_context_size: 'low'
     }]);
     assert.equal(client.calls[0].params.tool_choice, 'auto');
-    assert.equal(client.calls[0].params.max_tool_calls, 2);
+    assert.equal(client.calls[0].params.max_tool_calls, 5);
     assert.equal(client.calls[0].params.safety_identifier, 'usr_hash');
     assert.equal(client.calls[0].params.store, false);
     assert.match(client.calls[0].params.instructions, /through SMS text messages/i);
@@ -220,7 +220,7 @@ test('deep voice answers use the frontier model without storing the response', a
         search_context_size: 'low'
     }]);
     assert.equal(client.calls[0].params.tool_choice, 'auto');
-    assert.equal(client.calls[0].params.max_tool_calls, 2);
+    assert.equal(client.calls[0].params.max_tool_calls, 5);
     assert.match(client.calls[0].params.instructions, /current,\s+recent/i);
     assert.match(client.calls[0].params.instructions, /do not read URLs/i);
     assert.match(client.calls[0].params.input, /Recent conversation context/);

@@ -55,7 +55,7 @@ const WEB_SEARCH_TOOL = Object.freeze({
     type: 'web_search',
     search_context_size: 'low'
 });
-const WEB_SEARCH_MAX_TOOL_CALLS = 2;
+const WEB_SEARCH_MAX_TOOL_CALLS = 20;
 const REQUIRED_WEB_SEARCH_PATTERNS = Object.freeze([
     /https?:\/\//i,
     /\b(?:search|browse|google)\s+(?:the\s+)?(?:web|internet|online|for)\b/i,
@@ -531,7 +531,7 @@ class AiService {
 
         const conversationEpoch = this.conversationEpochs.get(safetyIdentifier) || 0;
         const prior = this.textQueues.get(safetyIdentifier) || Promise.resolve();
-        const task = prior.catch(() => {}).then(() => this.createTextReply(
+        const task = prior.catch(() => { }).then(() => this.createTextReply(
             safetyIdentifier,
             cleanText,
             conversationEpoch,
