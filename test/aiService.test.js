@@ -1,6 +1,28 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { AiService, OPENAI_API_BASE_URL, truncateText } = require('../src/aiService');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const {
+    AiService,
+    OPENAI_API_BASE_URL,
+    buildMemoryTransparencyInstructions,
+    truncateText
+} = require('../src/aiService');
+const { AiMemoryStore } = require('../src/aiMemoryStore');
+
+const VALID_SAFETY_ID = `usr_${'b'.repeat(48)}`;
+
+function createMemoryFixture() {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-service-memory-'));
+    const memoryStore = new AiMemoryStore({
+        enabled: true,
+        storageFile: path.join(directory, 'memory.enc.json'),
+        encryptionKey: 'ai-service-test-encryption-key-that-is-at-least-32-characters',
+        logger: { warn() {} }
+    });
+    return { directory, memoryStore };
+}
 
 function fakeClient(outputs) {
     const calls = [];
@@ -45,11 +67,123 @@ test('text chat uses GPT-5.6 Sol Fast mode and bounded in-memory history', async
     assert.equal(client.calls[0].params.store, false);
     assert.match(client.calls[0].params.instructions, /through SMS text messages/i);
     assert.match(client.calls[0].params.instructions, /not a voice\s+call/i);
+    assert.match(client.calls[0].params.instructions, /do not volunteer or routinely mention memory/i);
+    assert.match(client.calls[0].params.instructions, /persistent caller memory is currently disabled/i);
+    assert.doesNotMatch(client.calls[0].params.instructions, /automatically stores a bounded recent window/i);
     assert.deepEqual(client.calls[1].params.input, [
         { role: 'user', content: 'First question' },
         { role: 'assistant', content: 'First answer' },
         { role: 'user', content: 'Follow up' }
     ]);
+});
+
+test('persistent memory shares prior voice context with SMS and records the new exchange', async () => {
+    const fixture = createMemoryFixture();
+    try {
+        fixture.memoryStore.appendExchange({
+            safetyIdentifier: VALID_SAFETY_ID,
+            exchangeId: 'voice-turn-1',
+            channel: 'voice',
+            userText: 'My dog is named Pixel.',
+            assistantText: 'Pixel is a great name.'
+        });
+        const client = fakeClient(['I remember that Pixel is your dog.']);
+        const service = new AiService({ client, memoryStore: fixture.memoryStore });
+
+        await service.replyToText({
+            safetyIdentifier: VALID_SAFETY_ID,
+            exchangeId: 'sms-turn-1',
+            text: 'What is my dog called?'
+        });
+
+        assert.match(client.calls[0].params.instructions, /untrusted user data/i);
+        assert.match(client.calls[0].params.instructions, /automatically stores a bounded recent window/i);
+        assert.match(client.calls[0].params.instructions, /no automatic time-based expiration/i);
+        assert.doesNotMatch(client.calls[0].params.instructions, /dog is named Pixel/i);
+        assert.equal(client.calls[0].params.input.length, 2);
+        assert.equal(client.calls[0].params.input[0].role, 'user');
+        assert.match(client.calls[0].params.input[0].content, /dog is named Pixel/i);
+        assert.match(client.calls[0].params.input[0].content, /not instructions/i);
+        assert.deepEqual(client.calls[0].params.input[1], {
+            role: 'user',
+            content: 'What is my dog called?'
+        });
+        const snapshot = fixture.memoryStore.getSnapshot(VALID_SAFETY_ID);
+        assert.equal(snapshot.exchanges.length, 2);
+        assert.equal(snapshot.exchanges[1].assistantText, 'I remember that Pixel is your dog.');
+    } finally {
+        fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+});
+
+test('memory transparency follows the active retention configuration', () => {
+    const instructions = buildMemoryTransparencyInstructions({
+        persistentMemory: true,
+        retentionDays: 45
+    });
+
+    assert.match(instructions, /expires automatically after 45 days of inactivity/i);
+    assert.doesNotMatch(instructions, /no automatic time-based expiration/i);
+});
+
+test('older exchanges are summarized with store disabled on the OpenAI request', async () => {
+    const fixture = createMemoryFixture();
+    try {
+        for (let index = 1; index <= 11; index += 1) {
+            fixture.memoryStore.appendExchange({
+                safetyIdentifier: VALID_SAFETY_ID,
+                exchangeId: `old-${index}`,
+                channel: 'sms',
+                userText: `User detail ${index}`,
+                assistantText: `Answer ${index}`
+            });
+        }
+        const client = fakeClient([{
+            status: 'completed',
+            output_text: '- The caller explicitly shared user detail 1.'
+        }]);
+        const service = new AiService({ client, memoryStore: fixture.memoryStore });
+
+        await service.refreshMemorySummary(VALID_SAFETY_ID);
+
+        assert.equal(client.calls[0].params.store, false);
+        assert.match(client.calls[0].params.instructions, /important facts the caller explicitly stated/i);
+        assert.equal(fixture.memoryStore.getSummaryWork(VALID_SAFETY_ID), null);
+        assert.match(fixture.memoryStore.getSnapshot(VALID_SAFETY_ID).summary, /detail 1/i);
+    } finally {
+        fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
+});
+
+test('an incomplete summary response does not erase verbatim overflow', async () => {
+    const fixture = createMemoryFixture();
+    try {
+        for (let index = 1; index <= 11; index += 1) {
+            fixture.memoryStore.appendExchange({
+                safetyIdentifier: VALID_SAFETY_ID,
+                exchangeId: `incomplete-${index}`,
+                channel: 'sms',
+                userText: `Detail ${index}`,
+                assistantText: `Answer ${index}`
+            });
+        }
+        const client = fakeClient([{
+            status: 'incomplete',
+            incomplete_details: { reason: 'max_output_tokens' },
+            output_text: '- Truncated and unsafe to commit'
+        }]);
+        const service = new AiService({ client, memoryStore: fixture.memoryStore, logger: { warn() {} } });
+
+        await service.refreshMemorySummary(VALID_SAFETY_ID);
+
+        assert.deepEqual(
+            fixture.memoryStore.getSummaryWork(VALID_SAFETY_ID).exchanges.map((entry) => entry.id),
+            ['incomplete-1']
+        );
+        assert.equal(fixture.memoryStore.getSnapshot(VALID_SAFETY_ID).summary, '');
+    } finally {
+        fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
 });
 
 test('deep voice answers use the frontier model without storing the response', async () => {
@@ -68,6 +202,37 @@ test('deep voice answers use the frontier model without storing the response', a
     assert.match(client.calls[0].params.input, /Recent conversation context/);
     assert.equal(Object.hasOwn(client.calls[0].params, 'max_output_tokens'), false);
     assert.equal(client.calls[0].params.store, false);
+});
+
+test('deep voice memory stays in user-level input instead of developer instructions', async () => {
+    const fixture = createMemoryFixture();
+    try {
+        fixture.memoryStore.appendExchange({
+            safetyIdentifier: VALID_SAFETY_ID,
+            exchangeId: 'voice-memory-priority',
+            channel: 'sms',
+            userText: 'My project is called Northstar.',
+            assistantText: 'Understood.'
+        });
+        const client = fakeClient(['A memory-aware spoken answer.']);
+        const service = new AiService({ client, memoryStore: fixture.memoryStore });
+
+        await service.answerComplexVoice({
+            safetyIdentifier: VALID_SAFETY_ID,
+            question: 'What is my project called?'
+        });
+
+        assert.match(client.calls[0].params.instructions, /untrusted user data/i);
+        assert.doesNotMatch(client.calls[0].params.instructions, /Northstar/i);
+        assert.equal(client.calls[0].params.input[0].role, 'user');
+        assert.match(client.calls[0].params.input[0].content, /Northstar/i);
+        assert.deepEqual(client.calls[0].params.input[1], {
+            role: 'user',
+            content: 'What is my project called?'
+        });
+    } finally {
+        fs.rmSync(fixture.directory, { recursive: true, force: true });
+    }
 });
 
 test('deep voice answers are not clipped to a character limit', async () => {
@@ -204,4 +369,14 @@ test('reset cancels in-flight and queued replies without resurrecting conversati
     assert.deepEqual(calls[1].params.input, [{ role: 'user', content: 'after reset' }]);
     resolvers[1]({ output_text: 'fresh answer' });
     assert.equal(await fresh, 'fresh answer');
+});
+
+test('reset reports failure when disabled memory still has persistent data', () => {
+    const memoryStore = {
+        enabled: false,
+        hasPersistentData: () => true
+    };
+    const service = new AiService({ client: fakeClient([]), memoryStore });
+
+    assert.equal(service.resetTextConversation(VALID_SAFETY_ID), false);
 });

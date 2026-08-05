@@ -54,6 +54,36 @@ function formatBroadcastStartedAt(isoString) {
     return `${weekday}, ${monthDay}, at ${time} New York time`;
 }
 
+function formatDuration(totalSeconds) {
+    const roundedSeconds = Math.round(Number(totalSeconds));
+    if (!Number.isFinite(roundedSeconds) || roundedSeconds <= 0) {
+        return null;
+    }
+
+    const hours = Math.floor(roundedSeconds / 3600);
+    const minutes = Math.floor((roundedSeconds % 3600) / 60);
+    const seconds = roundedSeconds % 60;
+    const parts = [];
+
+    if (hours) {
+        parts.push(`${hours} ${hours === 1 ? 'hour' : 'hours'}`);
+    }
+    if (minutes) {
+        parts.push(`${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`);
+    }
+    if (seconds) {
+        parts.push(`${seconds} ${seconds === 1 ? 'second' : 'seconds'}`);
+    }
+
+    if (parts.length === 1) {
+        return parts[0];
+    }
+    if (parts.length === 2) {
+        return `${parts[0]} and ${parts[1]}`;
+    }
+    return `${parts[0]}, ${parts[1]}, and ${parts[2]}`;
+}
+
 class PhoneService {
     constructor({ streamerName = 'Destiny', storageFile } = {}) {
         this.streamerName = streamerName || 'Destiny';
@@ -89,7 +119,7 @@ class PhoneService {
         const liveLine = this.state.isLive
             ? `To hear Destiny's live stream, press 1.`
             : `There is no live stream right now.`;
-        return `${liveLine} Press 2 through 6 for the last five archived streams, from most recent to oldest. Press 7 to hear the playback controls. Press 8 to talk with the AI assistant.`;
+        return `${liveLine} Press 2 through 6 for the last five archived streams, from most recent to oldest. Press 7 to hear the playback controls. Press 8 to talk with ChatGPT.`;
     }
 
     getControlsInfoPrompt() {
@@ -113,7 +143,7 @@ class PhoneService {
     }
 
     buildAiStreamTwiML(webSocketUrl, sessionToken) {
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">You are now speaking with an AI assistant powered by OpenAI. Audio and a transcript are processed to answer you. You can start speaking now, or press 8 to return to the main menu.</Say>\n  <Connect>\n    <Stream url="${escapeXmlAttribute(webSocketUrl)}">\n      <Parameter name="sessionToken" value="${escapeXmlAttribute(sessionToken)}"/>\n    </Stream>\n  </Connect>\n  <Redirect method="POST">/voice/menu</Redirect>\n</Response>`;
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Connect>\n    <Stream url="${escapeXmlAttribute(webSocketUrl)}">\n      <Parameter name="sessionToken" value="${escapeXmlAttribute(sessionToken)}"/>\n    </Stream>\n  </Connect>\n  <Redirect method="POST">/voice/menu</Redirect>\n</Response>`;
     }
 
     buildPlaybackTwiML(prompt, audioUrl = null) {
@@ -277,9 +307,13 @@ class PhoneService {
         this.saveState();
 
         const broadcastTime = formatBroadcastStartedAt(recording.broadcastStartedAt);
-        const message = broadcastTime
+        const introduction = broadcastTime
             ? `You are now listening to ${recording.title}, from ${broadcastTime}.`
             : `You are now listening to ${recording.title}.`;
+        const duration = formatDuration(recording.durationSeconds);
+        const message = duration
+            ? `${introduction} The total stream length is ${duration}.`
+            : introduction;
 
         return {
             type: 'recording',
@@ -404,4 +438,4 @@ class PhoneService {
     }
 }
 
-module.exports = { PhoneService, createDefaultState, escapeXml, escapeXmlAttribute };
+module.exports = { PhoneService, createDefaultState, escapeXml, escapeXmlAttribute, formatDuration };

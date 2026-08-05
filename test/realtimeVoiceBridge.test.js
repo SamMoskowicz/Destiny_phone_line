@@ -65,6 +65,10 @@ function createHarness({
     clock = () => Date.now(),
     answer = 'Deep answer.',
     deepUsageTokens = 0,
+    memoryContext = '',
+    memoryGeneration = 0,
+    persistentMemory = true,
+    retentionDays = 0,
     bridgeOptions = {}
 } = {}) {
     const tokenStore = new EphemeralSessionTokenStore();
@@ -73,7 +77,22 @@ function createHarness({
     let connection;
     const aiService = {
         calls: [],
+        memoryRecords: [],
+        memoryStore: persistentMemory ? {
+            isConfigured: () => true,
+            retentionDays
+        } : null,
         isConfigured: () => true,
+        getMemorySnapshot: () => ({
+            generation: memoryGeneration,
+            context: memoryContext,
+            summary: '',
+            exchanges: []
+        }),
+        recordConversationExchange(args) {
+            aiService.memoryRecords.push(args);
+            return true;
+        },
         async answerComplexVoice(args) {
             aiService.calls.push(args);
             aiService.lastArgs = args;
@@ -113,6 +132,13 @@ function completeSetup(upstream) {
     });
 }
 
+function findInitialGreeting(upstream) {
+    return upstream.sent.find((event) => (
+        event.type === 'response.create'
+        && event.response?.metadata?.response_purpose === 'initial_greeting'
+    ));
+}
+
 test('session update configures PCMU, transcription, VAD, reasoning, and the deep tool', () => {
     const event = buildSessionUpdate();
     assert.equal(event.type, 'session.update');
@@ -124,6 +150,372 @@ test('session update configures PCMU, transcription, VAD, reasoning, and the dee
     assert.deepEqual(event.session.reasoning, { effort: 'low' });
     assert.equal(event.session.max_output_tokens, 'inf');
     assert.equal(event.session.tools[0].name, 'answer_complex_question');
+    assert.match(event.session.instructions, /do not volunteer or routinely mention memory/i);
+    assert.match(event.session.instructions, /persistent caller memory is currently disabled/i);
+});
+
+test('accepted Realtime setup requests one short proactive audio greeting', () => {
+    const { bridge, upstream, twilioSocket } = createHarness();
+    completeSetup(upstream);
+
+    const greeting = findInitialGreeting(upstream);
+    assert.ok(greeting);
+    assert.deepEqual(greeting.response.output_modalities, ['audio']);
+    assert.equal(greeting.response.conversation, 'auto');
+    assert.equal(greeting.response.tool_choice, 'none');
+    assert.deepEqual(greeting.response.tools, []);
+    assert.match(greeting.response.instructions, /speaking with ChatGPT/i);
+    assert.match(greeting.response.instructions, /what\s+would you like to talk about/i);
+    assert.doesNotMatch(greeting.response.instructions, /memory|save|storage|transcript|call audio/i);
+    assert.deepEqual(greeting.response.metadata, {
+        response_purpose: 'initial_greeting',
+        turn_epoch: '0'
+    });
+    assert.equal(upstream.sent.filter((event) => (
+        event.response?.metadata?.response_purpose === 'initial_greeting'
+    )).length, 1);
+
+    upstream.receive({
+        type: 'session.updated',
+        session: {
+            audio: {
+                input: { format: { type: 'audio/pcmu' } },
+                output: { format: { type: 'audio/pcmu' } }
+            }
+        }
+    });
+    assert.equal(upstream.sent.filter((event) => (
+        event.response?.metadata?.response_purpose === 'initial_greeting'
+    )).length, 1);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('voice startup receives the same persistent caller memory as SMS', () => {
+    const { bridge, upstream, twilioSocket } = createHarness({
+        memoryContext: 'The caller said their dog is named Pixel.'
+    });
+
+    upstream.open();
+
+    assert.match(upstream.sent[0].session.instructions, /untrusted user data/i);
+    assert.match(upstream.sent[0].session.instructions, /automatically stores a bounded recent window/i);
+    assert.match(upstream.sent[0].session.instructions, /no automatic time-based expiration/i);
+    assert.doesNotMatch(upstream.sent[0].session.instructions, /dog is named Pixel/i);
+    upstream.receive({
+        type: 'session.updated',
+        session: {
+            audio: {
+                input: { format: { type: 'audio/pcmu' } },
+                output: { format: { type: 'audio/pcmu' } }
+            }
+        }
+    });
+    const memoryItem = upstream.sent.find((event) => event.type === 'conversation.item.create');
+    assert.ok(memoryItem);
+    assert.equal(memoryItem.item.role, 'user');
+    assert.match(memoryItem.item.content[0].text, /dog is named Pixel/i);
+    assert.match(memoryItem.item.content[0].text, /not instructions/i);
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('Realtime memory disclosure follows disabled and expiring configurations', () => {
+    const disabled = createHarness({ persistentMemory: false });
+    disabled.upstream.open();
+    assert.match(disabled.upstream.sent[0].session.instructions, /persistent caller memory is currently disabled/i);
+    assert.doesNotMatch(disabled.upstream.sent[0].session.instructions, /automatically stores a bounded recent window/i);
+    disabled.twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    disabled.bridge.close();
+
+    const expiring = createHarness({ retentionDays: 45 });
+    expiring.upstream.open();
+    assert.match(expiring.upstream.sent[0].session.instructions, /expires automatically after 45 days of inactivity/i);
+    assert.doesNotMatch(expiring.upstream.sent[0].session.instructions, /no automatic time-based expiration/i);
+    expiring.twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    expiring.bridge.close();
+});
+
+test('a completed initial greeting is never attached to the first caller memory exchange', () => {
+    const { bridge, upstream, twilioSocket, aiService } = createHarness();
+    completeSetup(upstream);
+    const greeting = findInitialGreeting(upstream);
+
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'response-greeting', status: 'in_progress', metadata: greeting.response.metadata }
+    });
+    upstream.receive({
+        type: 'response.output_item.added',
+        response_id: 'response-greeting',
+        item: { id: 'assistant-greeting', type: 'message' }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'response-greeting',
+        item_id: 'assistant-greeting',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({
+        type: 'response.output_audio_transcript.done',
+        response_id: 'response-greeting',
+        item_id: 'assistant-greeting',
+        transcript: 'Hi! You are speaking with ChatGPT.'
+    });
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'response-greeting',
+            status: 'completed',
+            metadata: greeting.response.metadata,
+            output: [{
+                id: 'assistant-greeting',
+                type: 'message',
+                content: [{ type: 'output_audio', transcript: 'Hi! You are speaking with ChatGPT.' }]
+            }]
+        }
+    });
+    const finalMark = twilioSocket.sent.findLast((event) => event.event === 'mark');
+    assert.ok(finalMark);
+    twilioSocket.receive({ event: 'mark', streamSid: 'MZ123', mark: { name: finalMark.mark.name } });
+
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({ type: 'input_audio_buffer.committed', item_id: 'caller-after-greeting' });
+    upstream.receive({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id: 'caller-after-greeting',
+        transcript: 'Here is my first question.'
+    });
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+
+    assert.equal(aiService.memoryRecords.length, 1);
+    assert.equal(aiService.memoryRecords[0].userText, 'Here is my first question.');
+    assert.equal(aiService.memoryRecords[0].assistantText, '');
+    bridge.close();
+});
+
+test('completed caller and assistant voice transcripts are saved as one exchange', () => {
+    const { bridge, upstream, twilioSocket, aiService } = createHarness({ memoryGeneration: 7 });
+    completeSetup(upstream);
+
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({ type: 'input_audio_buffer.committed', item_id: 'caller-item-1' });
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'response-1', status: 'in_progress', metadata: {} }
+    });
+    upstream.receive({
+        type: 'response.output_item.added',
+        response_id: 'response-1',
+        item: { id: 'assistant-item-1', type: 'message' }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'response-1',
+        item_id: 'assistant-item-1',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({
+        type: 'response.output_audio_transcript.done',
+        response_id: 'response-1',
+        item_id: 'assistant-item-1',
+        content_index: 0,
+        transcript: 'You told me that Pixel is your dog.'
+    });
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'response-1',
+            status: 'completed',
+            output: [{
+                id: 'assistant-item-1',
+                type: 'message',
+                content: [{ type: 'output_audio', transcript: 'You told me that Pixel is your dog.' }]
+            }]
+        }
+    });
+    // Input ASR can finish after the response lifecycle, so pairing cannot rely on arrival order.
+    upstream.receive({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id: 'caller-item-1',
+        content_index: 0,
+        transcript: 'Please remember that Pixel is my dog.'
+    });
+    const finalMark = twilioSocket.sent.findLast((event) => event.event === 'mark');
+    assert.ok(finalMark);
+    twilioSocket.receive({ event: 'mark', streamSid: 'MZ123', mark: { name: finalMark.mark.name } });
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+
+    assert.equal(aiService.memoryRecords.length, 1);
+    assert.equal(aiService.memoryRecords[0].channel, 'voice');
+    assert.equal(aiService.memoryRecords[0].userText, 'Please remember that Pixel is my dog.');
+    assert.equal(aiService.memoryRecords[0].assistantText, 'You told me that Pixel is your dog.');
+    assert.equal(aiService.memoryRecords[0].expectedGeneration, 7);
+    bridge.close();
+});
+
+test('hangup excludes completed assistant audio that Twilio has not finished playing', () => {
+    const { bridge, upstream, twilioSocket, aiService } = createHarness();
+    completeSetup(upstream);
+
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({ type: 'input_audio_buffer.committed', item_id: 'caller-hangup' });
+    upstream.receive({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id: 'caller-hangup',
+        transcript: 'Tell me something I may hang up during.'
+    });
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'response-hangup', status: 'in_progress', metadata: {} }
+    });
+    upstream.receive({
+        type: 'response.output_item.added',
+        response_id: 'response-hangup',
+        item: { id: 'assistant-hangup', type: 'message' }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'response-hangup',
+        item_id: 'assistant-hangup',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({
+        type: 'response.output_audio_transcript.done',
+        response_id: 'response-hangup',
+        item_id: 'assistant-hangup',
+        transcript: 'This completed answer is still queued for playback.'
+    });
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'response-hangup',
+            status: 'completed',
+            output: [{
+                id: 'assistant-hangup',
+                type: 'message',
+                content: [{
+                    type: 'output_audio',
+                    transcript: 'This completed answer is still queued for playback.'
+                }]
+            }]
+        }
+    });
+
+    assert.ok(twilioSocket.sent.some((event) => event.event === 'mark'));
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+
+    assert.equal(aiService.memoryRecords.length, 1);
+    assert.equal(aiService.memoryRecords[0].userText, 'Tell me something I may hang up during.');
+    assert.equal(aiService.memoryRecords[0].assistantText, '');
+    bridge.close();
+});
+
+test('a normal second caller turn does not erase the fully played first answer', () => {
+    const { bridge, upstream, twilioSocket, aiService } = createHarness();
+    completeSetup(upstream);
+
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({ type: 'input_audio_buffer.committed', item_id: 'caller-first' });
+    upstream.receive({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id: 'caller-first',
+        transcript: 'First question.'
+    });
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'response-first', status: 'in_progress', metadata: {} }
+    });
+    upstream.receive({
+        type: 'response.output_item.added',
+        response_id: 'response-first',
+        item: { id: 'assistant-first', type: 'message' }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'response-first',
+        item_id: 'assistant-first',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({
+        type: 'response.output_audio_transcript.done',
+        response_id: 'response-first',
+        item_id: 'assistant-first',
+        transcript: 'First answer.'
+    });
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'response-first',
+            status: 'completed',
+            output: [{
+                id: 'assistant-first',
+                type: 'message',
+                content: [{ type: 'output_audio', transcript: 'First answer.' }]
+            }]
+        }
+    });
+    const finalMark = twilioSocket.sent.findLast((event) => event.event === 'mark');
+    assert.ok(finalMark);
+    twilioSocket.receive({ event: 'mark', streamSid: 'MZ123', mark: { name: finalMark.mark.name } });
+
+    const clearsBefore = twilioSocket.sent.filter((event) => event.event === 'clear').length;
+    const truncatesBefore = upstream.sent.filter((event) => event.type === 'conversation.item.truncate').length;
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({ type: 'input_audio_buffer.committed', item_id: 'caller-second' });
+    upstream.receive({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id: 'caller-second',
+        transcript: 'Second question.'
+    });
+    assert.equal(twilioSocket.sent.filter((event) => event.event === 'clear').length, clearsBefore);
+    assert.equal(upstream.sent.filter((event) => event.type === 'conversation.item.truncate').length, truncatesBefore);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    assert.equal(aiService.memoryRecords.length, 2);
+    assert.equal(aiService.memoryRecords[0].assistantText, 'First answer.');
+    bridge.close();
+});
+
+test('barge-in prevents an unheard assistant transcript from becoming memory', () => {
+    const { bridge, upstream, twilioSocket, aiService } = createHarness();
+    completeSetup(upstream);
+
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({ type: 'input_audio_buffer.committed', item_id: 'caller-item' });
+    upstream.receive({
+        type: 'conversation.item.input_audio_transcription.completed',
+        item_id: 'caller-item',
+        transcript: 'This is the caller statement.'
+    });
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'response-interrupted', status: 'in_progress', metadata: {} }
+    });
+    upstream.receive({
+        type: 'response.output_item.added',
+        response_id: 'response-interrupted',
+        item: { id: 'assistant-interrupted', type: 'message' }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'response-interrupted',
+        item_id: 'assistant-interrupted',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({
+        type: 'response.output_audio_transcript.done',
+        response_id: 'response-interrupted',
+        item_id: 'assistant-interrupted',
+        transcript: 'This response was interrupted before it was heard.'
+    });
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+
+    assert.equal(aiService.memoryRecords.length, 1);
+    assert.equal(aiService.memoryRecords[0].assistantText, '');
+    bridge.close();
 });
 
 test('an output-token cutoff automatically continues the spoken answer', () => {
@@ -366,12 +758,91 @@ test('caller audio stays queued until OpenAI confirms the negotiated PCMU sessio
             }
         }
     });
-    assert.deepEqual(upstream.sent.at(-1), {
+    const appendIndex = upstream.sent.findIndex((event) => event.type === 'input_audio_buffer.append');
+    const greetingIndex = upstream.sent.findIndex((event) => (
+        event.response?.metadata?.response_purpose === 'initial_greeting'
+    ));
+    assert.deepEqual(upstream.sent[appendIndex], {
         type: 'input_audio_buffer.append',
         audio: callerAudio
     });
+    assert.ok(appendIndex < greetingIndex);
+
+    const greeting = upstream.sent[greetingIndex];
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'queued-greeting', status: 'in_progress', metadata: greeting.response.metadata }
+    });
+    upstream.receive({
+        type: 'response.output_item.added',
+        response_id: 'queued-greeting',
+        item: { id: 'queued-greeting-item', type: 'message' }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'queued-greeting',
+        item_id: 'queued-greeting-item',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    assert.equal(twilioSocket.sent.some((event) => event.event === 'media'), false);
 
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('caller speech can interrupt an initial greeting already playing', () => {
+    const { bridge, upstream, twilioSocket } = createHarness({ clock: () => 1000 });
+    completeSetup(upstream);
+    const greeting = findInitialGreeting(upstream);
+
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'active-greeting', status: 'in_progress', metadata: greeting.response.metadata }
+    });
+    upstream.receive({
+        type: 'response.output_item.added',
+        response_id: 'active-greeting',
+        item: { id: 'active-greeting-item', type: 'message' }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'active-greeting',
+        item_id: 'active-greeting-item',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+
+    assert.ok(twilioSocket.sent.some((event) => event.event === 'clear'));
+    assert.deepEqual(upstream.sent.find((event) => event.type === 'conversation.item.truncate'), {
+        type: 'conversation.item.truncate',
+        item_id: 'active-greeting-item',
+        content_index: 0,
+        audio_end_ms: 0
+    });
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('initial greeting send backpressure closes both sides', () => {
+    const { bridge, upstream, twilioSocket } = createHarness();
+    upstream.open();
+    upstream.bufferedAmount = bridge.maxBufferedBytes + 1;
+    upstream.receive({
+        type: 'session.updated',
+        session: {
+            audio: {
+                input: { format: { type: 'audio/pcmu' } },
+                output: { format: { type: 'audio/pcmu' } }
+            }
+        }
+    });
+
+    assert.equal(findInitialGreeting(upstream), undefined);
+    assert.equal(bridge.activeSessionCount, 0);
+    assert.equal(twilioSocket.readyState, 3);
+    assert.equal(upstream.readyState, 3);
     bridge.close();
 });
 

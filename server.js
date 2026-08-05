@@ -13,6 +13,7 @@ const {
 const { TwilioSecurity, normalizeBaseUrl } = require('./src/twilioSecurity');
 const { RealtimeVoiceBridge } = require('./src/realtimeVoiceBridge');
 const { ConsentStore } = require('./src/consentStore');
+const { AiMemoryStore } = require('./src/aiMemoryStore');
 const { formatAiSms, smsMetrics } = require('./src/smsUtils');
 const kickBrowser = require('./src/kickBrowser');
 const hlsFetch = require('./src/hlsFetch');
@@ -26,11 +27,14 @@ const service = new PhoneService({
     storageFile: process.env.PHONE_SERVICE_STATE_FILE || undefined
 });
 
-// Messages, transcripts, and audio are never written to disk. Only HMAC-based
-// opt-out identifiers are persisted so consent survives process restarts.
-const AI_SAFETY_SALT_CONFIGURED = Boolean(String(process.env.AI_SAFETY_SALT || '').trim());
+// When explicitly enabled, recent text transcripts and compact caller memory
+// are encrypted before persistence. Raw phone numbers and call audio are not
+// stored in the AI memory file.
+const AI_SAFETY_SALT_CONFIGURED = String(process.env.AI_SAFETY_SALT || '').trim().length >= 32;
 const AI_SAFETY_SALT = process.env.AI_SAFETY_SALT || 'ai-disabled-without-stable-salt';
-const aiService = new AiService();
+const AI_MEMORY_REQUIRED = process.env.AI_MEMORY_ENABLED === 'true';
+const aiMemoryStore = new AiMemoryStore();
+const aiService = new AiService({ memoryStore: aiMemoryStore });
 const twilioSecurity = new TwilioSecurity();
 const consentStore = new ConsentStore();
 const aiSessionTokens = new EphemeralSessionTokenStore();
@@ -830,15 +834,33 @@ function buildAiWebSocketUrl(req = null) {
     return url.toString();
 }
 
+function normalizeCallerNumber(value) {
+    const number = String(value || '').trim();
+    return /^\+[1-9]\d{7,14}$/.test(number) ? number : null;
+}
+
+function isAiMemoryReady() {
+    return !AI_MEMORY_REQUIRED || (
+        AI_SAFETY_SALT_CONFIGURED
+        && aiMemoryStore.isConfigured()
+        && consentStore.isConfigured()
+    );
+}
+
+const AI_MEMORY_SMS_HELP = 'ChatGPT answers questions sent to this number. Reply STOP to unsubscribe.';
+const AI_MEMORY_UNAVAILABLE = 'ChatGPT memory is temporarily unavailable, so no AI conversation was processed. Please try again later.';
+
 async function handleSmsRequest(req, res, body) {
     if (!validateTwilioWebhook(req, res, body, { required: true })) {
         return;
     }
     const from = String(getBodyValue(body, 'From') || '').trim().slice(0, 64);
+    const normalizedFrom = normalizeCallerNumber(from);
     const messageSid = String(getBodyValue(body, 'MessageSid') || '').trim().slice(0, 128);
     const text = String(getBodyValue(body, 'Body') || '').trim().slice(0, 1600);
-    const safetyIdentifier = AI_SAFETY_SALT_CONFIGURED && from
-        ? createSafetyIdentifier(from, AI_SAFETY_SALT)
+    const identitySource = AI_MEMORY_REQUIRED ? normalizedFrom : from;
+    const safetyIdentifier = AI_SAFETY_SALT_CONFIGURED && identitySource
+        ? createSafetyIdentifier(identitySource, AI_SAFETY_SALT)
         : null;
     const keyword = text.toUpperCase();
     const optOutType = String(getBodyValue(body, 'OptOutType') || '').toUpperCase();
@@ -847,18 +869,43 @@ async function handleSmsRequest(req, res, body) {
 
     if (optOutType === 'STOP' || stopKeywords.has(keyword)) {
         if (safetyIdentifier) {
-            aiService.resetTextConversation(safetyIdentifier);
-            consentStore.optOut(safetyIdentifier);
+            aiVoiceBridge.forgetUser(safetyIdentifier);
+            if (!aiService.resetTextConversation(safetyIdentifier)) {
+                console.warn('[ai-memory] stop_delete_failed');
+            }
+            if (!consentStore.optOut(safetyIdentifier)) {
+                console.warn('[ai-preferences] stop_persist_failed');
+            }
         }
         sendTwiml(res, buildSmsTwiML());
         return;
     }
     if (optOutType === 'START' || startKeywords.has(keyword)) {
         if (safetyIdentifier) {
-            aiService.resetTextConversation(safetyIdentifier);
-            consentStore.optIn(safetyIdentifier);
+            if (!aiService.resetTextConversation(safetyIdentifier)) {
+                console.warn('[ai-memory] start_reset_failed');
+            }
+            const wasOptedOut = consentStore.isOptedOut(safetyIdentifier);
+            if (wasOptedOut && !consentStore.optIn(safetyIdentifier)) {
+                console.warn('[ai-preferences] start_persist_failed');
+            }
         }
         sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (['DELETE', 'FORGET', 'DELETE MEMORY', 'FORGET ME'].includes(keyword)) {
+        let memoryCleared = false;
+        if (safetyIdentifier) {
+            aiVoiceBridge.forgetUser(safetyIdentifier);
+            memoryCleared = aiService.resetTextConversation(safetyIdentifier);
+        }
+        sendSmsReply(
+            res,
+            messageSid,
+            memoryCleared
+                ? 'Your saved AI conversation memory for this number has been deleted. You can keep chatting or reply STOP to unsubscribe.'
+                : 'I could not verify that your saved AI memory was deleted. Please try again later.'
+        );
         return;
     }
     if (optOutType === 'HELP') {
@@ -868,13 +915,27 @@ async function handleSmsRequest(req, res, body) {
     }
     if (['HELP', 'INFO'].includes(keyword)) {
         if (safetyIdentifier && smsNoticeLimiter.consume(safetyIdentifier).allowed) {
-            sendSmsReply(res, messageSid, 'ChatGPT answers questions sent to this number. Reply STOP to unsubscribe.');
+            sendSmsReply(
+                res,
+                messageSid,
+                AI_MEMORY_REQUIRED
+                    ? AI_MEMORY_SMS_HELP
+                    : 'ChatGPT answers questions sent to this number. Reply STOP to unsubscribe.'
+            );
         } else {
             sendTwiml(res, buildSmsTwiML());
         }
         return;
     }
     if (!messageSid || !from) {
+        sendTwiml(res, buildSmsTwiML());
+        return;
+    }
+    if (AI_MEMORY_REQUIRED && !isAiMemoryReady()) {
+        sendSmsReply(res, messageSid, AI_MEMORY_UNAVAILABLE);
+        return;
+    }
+    if (AI_MEMORY_REQUIRED && !normalizedFrom) {
         sendTwiml(res, buildSmsTwiML());
         return;
     }
@@ -886,7 +947,6 @@ async function handleSmsRequest(req, res, body) {
         sendTwiml(res, buildSmsTwiML());
         return;
     }
-
     let message = null;
     try {
         message = await smsIdempotency.run(messageSid, async () => {
@@ -903,7 +963,11 @@ async function handleSmsRequest(req, res, body) {
             }
             activeSmsAiRequests += 1;
             try {
-                const answer = await aiService.replyToText({ safetyIdentifier, text });
+                const answer = await aiService.replyToText({
+                    safetyIdentifier,
+                    text,
+                    exchangeId: `sms-${messageSid}`
+                });
                 if (consentStore.isOptedOut(safetyIdentifier)) {
                     return null;
                 }
@@ -928,6 +992,39 @@ async function handleSmsRequest(req, res, body) {
         message = null;
     }
     sendSmsReply(res, messageSid, message);
+}
+
+function startAiVoiceSession(req, res, body, phoneNumber) {
+    const callSid = String(getBodyValue(body, 'CallSid') || '');
+    const webSocketUrl = buildAiWebSocketUrl(req);
+    if (!callSid || !webSocketUrl || !aiVoiceBridge.isConfigured() || !twilioSecurity.hasFixedPublicUrl()) {
+        sendTwiml(res, service.buildMenuTwiML('ChatGPT voice is not configured yet.'));
+        return;
+    }
+    if (!isAiMemoryReady()) {
+        sendTwiml(res, service.buildMenuTwiML('ChatGPT memory is temporarily unavailable. Please try again later.'));
+        return;
+    }
+    const normalizedPhoneNumber = normalizeCallerNumber(phoneNumber);
+    if (AI_MEMORY_REQUIRED && !normalizedPhoneNumber) {
+        sendTwiml(res, service.buildMenuTwiML('ChatGPT memory requires caller ID. Please call again without blocking your number.'));
+        return;
+    }
+    if (aiVoiceBridge.activeSessionCount >= aiVoiceBridge.maxSessions) {
+        sendTwiml(res, service.buildMenuTwiML('ChatGPT voice is busy. Please try again shortly.'));
+        return;
+    }
+    const safetyIdentifier = createSafetyIdentifier(
+        AI_MEMORY_REQUIRED ? normalizedPhoneNumber : phoneNumber,
+        AI_SAFETY_SALT
+    );
+    const limit = voiceStartLimiter.consume(safetyIdentifier);
+    if (!limit.allowed) {
+        sendTwiml(res, service.buildMenuTwiML('The AI call limit has been reached for now.'));
+        return;
+    }
+    const sessionToken = aiSessionTokens.issue({ callSid, safetyIdentifier });
+    sendTwiml(res, service.buildAiStreamTwiML(webSocketUrl, sessionToken));
 }
 
 function handleVoiceRequest(req, res, body) {
@@ -993,24 +1090,44 @@ function handleVoiceRequest(req, res, body) {
         }
 
         if (digits === '8') {
-            const callSid = String(getBodyValue(body, 'CallSid') || '');
-            const webSocketUrl = buildAiWebSocketUrl(req);
-            if (!callSid || !webSocketUrl || !aiVoiceBridge.isConfigured() || !twilioSecurity.hasFixedPublicUrl()) {
-                sendTwiml(res, service.buildMenuTwiML('The AI assistant is not configured yet.'));
+            if (!getBodyValue(body, 'CallSid')
+                || !buildAiWebSocketUrl(req)
+                || !aiVoiceBridge.isConfigured()
+                || !twilioSecurity.hasFixedPublicUrl()) {
+                sendTwiml(res, service.buildMenuTwiML('ChatGPT voice is not configured yet.'));
                 return;
             }
-            if (aiVoiceBridge.activeSessionCount >= aiVoiceBridge.maxSessions) {
-                sendTwiml(res, service.buildMenuTwiML('The AI assistant is busy. Please try again shortly.'));
+            if (!isAiMemoryReady()) {
+                sendTwiml(res, service.buildMenuTwiML('ChatGPT memory is temporarily unavailable. Please try again later.'));
                 return;
             }
-            const safetyIdentifier = createSafetyIdentifier(phoneNumber, AI_SAFETY_SALT);
-            const limit = voiceStartLimiter.consume(safetyIdentifier);
-            if (!limit.allowed) {
-                sendTwiml(res, service.buildMenuTwiML('The AI call limit has been reached for now.'));
+            if (AI_MEMORY_REQUIRED && !normalizeCallerNumber(phoneNumber)) {
+                sendTwiml(res, service.buildMenuTwiML('ChatGPT memory requires caller ID. Please call again without blocking your number.'));
                 return;
             }
-            const sessionToken = aiSessionTokens.issue({ callSid, safetyIdentifier });
-            sendTwiml(res, service.buildAiStreamTwiML(webSocketUrl, sessionToken));
+            startAiVoiceSession(req, res, body, phoneNumber);
+            return;
+        }
+
+        if (digits === '9') {
+            if (!isAiMemoryReady()) {
+                sendTwiml(res, service.buildMenuTwiML('ChatGPT memory is temporarily unavailable. Please try again later.'));
+                return;
+            }
+            const normalizedPhoneNumber = normalizeCallerNumber(phoneNumber);
+            if (AI_MEMORY_REQUIRED && !normalizedPhoneNumber) {
+                sendTwiml(res, service.buildMenuTwiML('ChatGPT memory requires caller ID. Please call again without blocking your number.'));
+                return;
+            }
+            const safetyIdentifier = createSafetyIdentifier(
+                AI_MEMORY_REQUIRED ? normalizedPhoneNumber : phoneNumber,
+                AI_SAFETY_SALT
+            );
+            aiVoiceBridge.forgetUser(safetyIdentifier);
+            const memoryCleared = aiService.resetTextConversation(safetyIdentifier);
+            sendTwiml(res, service.buildMenuTwiML(memoryCleared
+                ? 'Your saved ChatGPT memory has been deleted.'
+                : 'I could not verify that your saved ChatGPT memory was deleted. Please try again later.'));
             return;
         }
     }
@@ -1029,8 +1146,15 @@ async function handleVoiceWebhook(req, res) {
 async function handleHttpRequest(req, res) {
     const requestPath = getRequestPath(req);
     if (requestPath === '/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
+        const memoryReady = isAiMemoryReady();
+        res.writeHead(memoryReady ? 200 : 503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: memoryReady,
+            aiMemory: {
+                enabled: AI_MEMORY_REQUIRED,
+                ready: memoryReady
+            }
+        }));
         return;
     }
 
@@ -1435,11 +1559,15 @@ function startServer() {
         console.log(`Streamer configured: ${service.streamerName}`);
         console.log(`AI text chat: ${AI_SAFETY_SALT_CONFIGURED && aiService.isConfigured() && twilioSecurity.isConfigured() ? 'configured' : 'not configured'}`);
         console.log(`AI voice chat: ${aiVoiceBridge.isConfigured() && twilioSecurity.hasFixedPublicUrl() ? 'configured' : 'not configured'}`);
-        if (!process.env.AI_SAFETY_SALT) {
-            console.warn('AI_SAFETY_SALT is unset; AI text and voice endpoints are disabled.');
+        console.log(`AI persistent memory: ${aiMemoryStore.isConfigured() ? 'configured' : 'not configured'}`);
+        if (!AI_SAFETY_SALT_CONFIGURED) {
+            console.warn('AI_SAFETY_SALT must contain at least 32 characters; AI text and voice endpoints are disabled.');
         }
         if (process.env.NODE_ENV === 'production' && !twilioSecurity.isConfigured()) {
             console.warn('TWILIO_AUTH_TOKEN is unset; SMS and AI voice endpoints are disabled.');
+        }
+        if (AI_MEMORY_REQUIRED && !isAiMemoryReady()) {
+            console.warn('AI memory is enabled but its file, encryption key, or AI_SAFETY_SALT is invalid. AI chat is disabled.');
         }
 
         if (KICK_CHANNEL) {
@@ -1470,6 +1598,15 @@ function startServer() {
             }
         }, 30000);
         archiveSweepTimer.unref?.();
+
+        if (aiMemoryStore.retentionMs) {
+            const memoryRetentionSweepTimer = setInterval(() => {
+                if (aiMemoryStore.isConfigured()) {
+                    aiMemoryStore.pruneExpiredProfiles();
+                }
+            }, 60 * 60 * 1000);
+            memoryRetentionSweepTimer.unref?.();
+        }
     });
     return server;
 }

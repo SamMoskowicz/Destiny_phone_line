@@ -5,10 +5,11 @@ A simple voice-service backend for one streamer: Destiny.
 ## What it does
 - answers incoming calls with a brief phone menu
 - press 1 to hear the live stream (or a short "not live" message)
-- press 2 through 6 to hear the last five archived streams, with real skip/rewind/pause/resume
+- press 2 through 6 to hear the last five archived streams, with the total duration announced before playback and real skip/rewind/pause/resume
 - press 7 to hear the in-playback controls
-- press 8 to have a low-latency spoken conversation with an OpenAI assistant
+- press 8 to have a low-latency spoken conversation with ChatGPT
 - text the same Twilio number to chat with the assistant over SMS
+- automatically shares encrypted, per-caller memory between SMS and AI voice
 - auto-detects when Destiny's Kick channel goes live and relays it to callers over `/live.mp3`
 - automatically archives Destiny's recent Kick VODs so the last five are always available to callers, no manual step required
 - remembers each caller's position per recording and resumes from there
@@ -33,12 +34,14 @@ npm start
 curl http://localhost:3000/health
 ```
 
+When persistent memory is enabled, this returns HTTP 503 instead of silently running without memory if the encrypted store, STOP/START preference store, or safety salt is unavailable.
+
 ## Deploy to Render
 This runs via **Docker**, not Render's Node buildpack, because headless Chrome needs system libraries (fonts, NSS, GTK, etc.) that the plain Node environment doesn't have. `Dockerfile` in this repo installs them.
 
 1. Create a GitHub repository containing this folder.
 2. Import the repo into Render as a **Docker** web service (or point an existing service at this repo - if it was originally created as a Node-runtime service, you'll likely need to recreate it as a Docker service, since Render doesn't support switching an existing service's runtime in place).
-3. Render will use the included `render.yaml`, which sets `STREAMER_NAME` and `KICK_CHANNEL` for you.
+3. Render will use the included `render.yaml`, which sets `STREAMER_NAME` and `KICK_CHANNEL`, creates a 1 GB persistent disk at `/var/data`, and generates separate safety-salt and AI-memory encryption secrets. Only encrypted AI memory and pseudonymous STOP/START state use that disk; raw caller playback-progress state remains on the service's ephemeral filesystem.
 4. In the Render dashboard, set `ADMIN_TOKEN` to a secret value (render.yaml declares it but leaves the value for you to fill in).
 5. After deployment, copy the public Render URL. `RENDER_EXTERNAL_URL` is set automatically by Render, so the app already knows its own public URL for building playback links.
 6. In your phone provider, configure the webhook URL for incoming calls to:
@@ -47,13 +50,15 @@ This runs via **Docker**, not Render's Node buildpack, because headless Chrome n
 
 **Resource note**: headless Chrome plus ffmpeg (live relay and/or per-caller recording playback) can add up on a small instance. Watch Render's memory metrics after deploying and size up if you see restarts/OOM kills.
 
+**Persistent-disk note**: only files beneath the disk mount survive Render restarts and deploys. A disk adds storage cost, pins this service to one instance, and causes brief downtime during deploys. The Blueprint deliberately leaves `PHONE_SERVICE_STATE_FILE` off this disk so raw caller playback-progress state is not made durable alongside AI memory. If this existing service is not managed by the Blueprint, attach a 1 GB disk at `/var/data` in the Render dashboard and add the memory variables listed below manually. See [Render's persistent disk documentation](https://render.com/docs/disks).
+
 ## Twilio setup
 If you use Twilio:
 1. Buy or configure a phone number.
 2. In the Twilio Voice configuration, set the webhook URL for incoming calls to `${RENDER_URL}/voice`.
-3. In Messaging configuration, set **A message comes in** to `${RENDER_URL}/sms` using HTTP POST. A Twilio Messaging Service with Advanced Opt-Out is recommended.
+3. In Messaging configuration, set **A message comes in** to `${RENDER_URL}/sms` using HTTP POST. A Twilio Messaging Service with Advanced Opt-Out is recommended. When Advanced Opt-Out is enabled, Twilio supplies its own HELP response instead of the application's HELP text.
 4. Set `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` for the account that owns your numbers. Any number in that account can use the webhooks; incoming voice, SMS, and AI Media Stream requests remain signature-checked. SMS and AI voice are disabled without the auth token.
-5. Set `OPENAI_API_KEY`, `AI_SAFETY_SALT`, and a fixed HTTPS `PUBLIC_BASE_URL`. The API key stays on the server and is never placed in TwiML or sent to the caller.
+5. Set `OPENAI_API_KEY`, a random `AI_SAFETY_SALT` of at least 32 characters, and a fixed HTTPS `PUBLIC_BASE_URL`. For persistent memory, also enable `AI_MEMORY_ENABLED` and set a separate generated `AI_MEMORY_ENCRYPTION_KEY`. The Blueprint generates both local memory secrets for a new service. These secrets stay on the server and are never placed in TwiML or sent to the caller.
 6. Live and archived playback are both served internally (`/live.mp3`, `/recordings/:id/play`) - you don't need a separate relay or tunnel.
 7. For manual overrides, send requests to `/admin/stream/live`, `/admin/stream/stop`, and `/admin/stream/recording` with an `Authorization: Bearer <ADMIN_TOKEN>` header.
 
@@ -63,11 +68,27 @@ Voice and SMS use different paths so each can meet its own latency target:
 
 - **Normal voice turns:** Twilio's bidirectional Media Stream passes 8 kHz PCMU audio directly to `gpt-realtime-2.1`. OpenAI performs speech understanding, optional `gpt-transcribe` transcription, reasoning, and speech generation. No ffmpeg conversion is needed.
 - **Difficult voice turns:** the Realtime model can call a read-only `answer_complex_question` tool backed by `gpt-5.6-sol`, low reasoning, Fast mode, and a 3.5-second server timeout. The Realtime model then speaks that answer.
-- **SMS:** `gpt-5.6-sol` uses low reasoning and Fast mode with a 4.5-second timeout. A small in-memory conversation history provides follow-up context.
+- **SMS:** `gpt-5.6-sol` uses low reasoning and Fast mode with a 4.5-second timeout. The same protected caller memory used by voice provides follow-up context.
 
 Those are aggressive latency-oriented defaults, not a hard end-to-end guarantee: carrier delay, Twilio, OpenAI load, and the length of the answer also affect timing. Easy spoken turns avoid the second model call and should be the quickest. Fast mode is deliberately enabled because the requested priority is intelligence within a few seconds; set `OPENAI_FAST_MODE=false` to reduce API cost at the expense of latency.
 
-Pressing 8 during AI voice chat closes the Media Stream and returns to the main menu. Voice sessions are limited to 10 minutes and 30 turns by default, and repeated silence also ends a call. SMS history, AI transcripts, and audio are held only in process memory. STOP/START consent is the exception: only a keyed, non-phone-number identifier is saved in `data/ai-consent.json` (or `AI_CONSENT_FILE`). Put that file on durable storage in production and use a shared consent/rate-limit store before scaling beyond one instance.
+When persistent memory is enabled and available, every successful SMS and AI voice exchange updates memory automatically. There is no `AGREE` prompt, recurring notice, or separate consent step. If memory is disabled, SMS chat remains ephemeral. If memory is enabled but unavailable, AI chat fails closed until storage is healthy.
+
+For voice, pressing 8 opens the Media Stream immediately: there is no additional Twilio text-to-speech preamble or storage notice, and the OpenAI voice gives a short natural ChatGPT greeting as soon as the Realtime session is ready. ChatGPT does not volunteer storage details, but if a caller asks, it explains accurately what is saved and how to delete it.
+
+`DELETE` or `FORGET` clears the application's memory that exists for that caller at that moment while keeping SMS enabled. It does not permanently disable memory: a later successful chat can create new memory automatically. `STOP` clears memory and opts the caller out of SMS; after `START`, persistent SMS memory resumes automatically. Voice callers can press 9 at the main menu to erase memory, although that control is intentionally not announced on every call. Deletion does not remove Twilio carrier records, provider safety logs, or already-created infrastructure snapshots.
+
+Disabling `AI_MEMORY_ENABLED` does not erase an existing encrypted file. Delete caller memory before disabling the feature, or remove the whole encrypted file deliberately if all profiles must be destroyed.
+
+Memory is application-managed and shared across SMS and AI voice for the same protected caller identifier. The identifier is derived from the caller's `From` number, not the destination `To` number, so the same memory follows that caller across every Twilio number in the configured account that uses these webhooks. This is phone-number identity, not a verified person or account: if a carrier reassigns a number, its new owner can inherit the prior caller's memory. Add a PIN or account-verification layer if that risk is unacceptable.
+
+By default, the newest 10 active exchanges are stored verbatim. When an older exchange rolls out of that active window, it moves into a bounded encrypted overflow of up to 10 exchanges while awaiting summarization. A `store: false` OpenAI request then folds important, explicitly stated key points into a compact summary and removes the summarized overflow. If summarization remains unavailable after that overflow fills, the oldest pending exchange is dropped to keep storage bounded. The summary deliberately excludes credentials and avoids inferred sensitive traits. Voice "verbatim" means the exact transcription returned by OpenAI, which can contain speech-recognition errors; raw call audio is never saved.
+
+Caller profiles do not expire automatically by default. They remain until the caller uses `DELETE`, `FORGET`, `STOP`, or voice-menu key 9; an operator removes the data; infrastructure is lost; or a configured storage bound is reached. Set `AI_MEMORY_RETENTION_DAYS` to a positive number only if time-based expiration is deliberately wanted.
+
+The memory file is encrypted with AES-256-GCM using `AI_MEMORY_ENCRYPTION_KEY` and contains the HMAC-based caller identifier rather than the raw phone number. Rotating either that encryption key or `AI_SAFETY_SALT` makes existing memory unreadable or unreachable. Keep both secrets stable and backed up securely.
+
+Pressing 8 during an active AI voice chat closes the Media Stream and returns to the main menu. Voice sessions are limited to 10 minutes and 30 turns by default, and repeated silence also ends a call.
 
 All model traffic uses the official OpenAI API endpoints. The key-bearing endpoints are pinned to OpenAI rather than being configurable through `OPENAI_BASE_URL` or a Realtime URL override.
 
@@ -107,8 +128,17 @@ curl -X POST "${RENDER_URL}/admin/stream/recording" \
 - OPENAI_API_KEY: server-side OpenAI API key; required for both AI modes
 - TWILIO_ACCOUNT_SID: expected Twilio account for signed webhooks
 - TWILIO_AUTH_TOKEN: validates Twilio HTTP and WebSocket signatures; required for SMS and AI voice
-- AI_SAFETY_SALT: required long random secret used to create stable, privacy-preserving OpenAI safety identifiers; AI is disabled without it and rotating it also changes locally stored consent identifiers
-- AI_CONSENT_FILE: local STOP/START consent file; defaults to `data/ai-consent.json` and should live on durable storage
+- AI_SAFETY_SALT: required random secret of at least 32 characters used to create stable, privacy-preserving OpenAI safety identifiers; AI is disabled without it and rotating it also changes locally stored preference identifiers
+- AI_MEMORY_ENABLED: set to `true` to enable persistent cross-channel memory; the included Render Blueprint enables it
+- AI_MEMORY_FILE: encrypted memory file; defaults to `data/ai-memory.enc.json`, and the Render Blueprint uses `/var/data/ai-memory.enc.json`
+- AI_MEMORY_ENCRYPTION_KEY: separate random secret of at least 32 characters; required when memory is enabled and generated automatically for a new Blueprint service
+- AI_MEMORY_RECENT_EXCHANGES: number of newest verbatim exchanges retained per caller; defaults to 10 and is clamped to 1-20
+- AI_MEMORY_MAX_PENDING_SUMMARY: maximum encrypted verbatim overflow retained while older exchanges await key-point summarization; defaults to 10
+- AI_MEMORY_RETENTION_DAYS: optional inactivity expiration for a caller's profile; defaults to `0`, which disables automatic time-based deletion
+- AI_MEMORY_MAX_USERS: maximum caller profiles; defaults to 10000
+- AI_MEMORY_MAX_FIELD_CHARACTERS / AI_MEMORY_MAX_CONTEXT_CHARACTERS: abuse and model-context bounds; default to 16000 / 32000
+- AI_CONSENT_FILE: local STOP/START opt-out-state file; defaults to `data/ai-consent.json`, and the Render Blueprint uses `/var/data/ai-consent.json` (the legacy variable name is retained for deployment compatibility)
+- PHONE_SERVICE_STATE_FILE: optional archive/playback and caller-progress state file; defaults to `data/phone-service-state.json` and is intentionally not placed on the Render AI-memory disk because it contains raw caller playback state
 - OPENAI_REALTIME_MODEL: defaults to `gpt-realtime-2.1` (the full model, not mini)
 - OPENAI_REALTIME_REASONING: defaults to `low`; `medium` is smarter but is more likely to miss the latency target
 - OPENAI_REALTIME_VOICE: defaults to `marin`
@@ -122,4 +152,4 @@ curl -X POST "${RENDER_URL}/admin/stream/recording" \
 - AI_SMS_PER_MINUTE, AI_SMS_PER_DAY, AI_SMS_GLOBAL_PER_HOUR, AI_SMS_GLOBAL_PER_DAY, AI_SMS_MAX_CONCURRENT: model-call abuse/spend controls
 - AI_SMS_OUTBOUND_SEGMENTS_PER_HOUR / AI_SMS_OUTBOUND_SEGMENTS_PER_DAY: carrier-spend limits; each AI answer is also capped at three GSM-7 or UCS-2 segments
 
-The included limiters and idempotency caches are in memory, which is appropriate for the current single-instance Render service. Before running multiple instances, move consent, token consumption, SMS deduplication, rate limits, and active-call coordination to a durable shared store such as Redis or a database.
+The included AI-memory file, STOP/START preference store, limiters, and idempotency caches assume one running instance. Before scaling horizontally, move AI memory, opt-out state, token consumption, SMS deduplication, rate limits, and active-call coordination to transactional shared storage such as a database or Redis, as appropriate.

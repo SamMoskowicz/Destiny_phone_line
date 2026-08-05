@@ -3,7 +3,15 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { PhoneService } = require('../src/phoneService');
+const { PhoneService, formatDuration } = require('../src/phoneService');
+
+test('formats archived stream durations naturally', () => {
+    assert.equal(formatDuration(1), '1 second');
+    assert.equal(formatDuration(61), '1 minute and 1 second');
+    assert.equal(formatDuration(7384), '2 hours, 3 minutes, and 4 seconds');
+    assert.equal(formatDuration(0), null);
+    assert.equal(formatDuration('unknown'), null);
+});
 
 test('menu announces live status and lists the other options', () => {
     const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}.json`);
@@ -12,7 +20,7 @@ test('menu announces live status and lists the other options', () => {
     assert.match(service.getMenuPrompt(), /no live stream/i);
     assert.match(service.getMenuPrompt(), /2 through 6/i);
     assert.match(service.getMenuPrompt(), /press 7/i);
-    assert.match(service.getMenuPrompt(), /press 8.*AI assistant/i);
+    assert.match(service.getMenuPrompt(), /press 8.*ChatGPT/i);
 
     service.startStream();
     assert.match(service.getMenuPrompt(), /press 1/i);
@@ -53,6 +61,23 @@ test('keeps only five recent recordings and remembers caller progress', () => {
     assert.equal(resumed.positionSeconds, 120);
 
     fs.unlinkSync(tempFile);
+});
+
+test('archived stream introduction ends with its total duration', () => {
+    const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
+    const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+    service.addRecording({ title: 'Long stream', durationSeconds: 7384 });
+
+    const selection = service.selectRecording('+15551234567', '2');
+
+    assert.equal(
+        selection.message,
+        'You are now listening to Long stream. The total stream length is 2 hours, 3 minutes, and 4 seconds.'
+    );
+
+    if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+    }
 });
 
 test('playback controls seek, pause/resume, and return to the menu', () => {
@@ -113,7 +138,7 @@ test('builds a TwiML menu response for Destiny', () => {
     }
 });
 
-test('builds bidirectional AI Stream TwiML with disclosure and escaped attributes', () => {
+test('builds bidirectional AI Stream TwiML without a robotic preamble', () => {
     const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
     const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
 
@@ -121,8 +146,24 @@ test('builds bidirectional AI Stream TwiML with disclosure and escaped attribute
     assert.match(twiml, /<Connect>/);
     assert.match(twiml, /<Stream url="wss:\/\/example\.com\/voice\/ai-stream\?x=1&amp;y=2">/);
     assert.match(twiml, /name="sessionToken" value="token&quot;value"/);
-    assert.match(twiml, /powered by OpenAI/i);
+    assert.doesNotMatch(twiml, /<Say/i);
+    assert.doesNotMatch(twiml, /speaking with ChatGPT/i);
     assert.match(twiml, /<Redirect method="POST">\/voice\/menu<\/Redirect>/);
+
+    if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+    }
+});
+
+test('the main menu starts ChatGPT without a storage or consent announcement', () => {
+    const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
+    const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+
+    const prompt = service.getMenuPrompt();
+
+    assert.match(prompt, /press 8 to talk with ChatGPT/i);
+    assert.doesNotMatch(prompt, /agree|consent|saving|transcript|memory|call audio/i);
+    assert.doesNotMatch(prompt, /press 9/i);
 
     if (fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);

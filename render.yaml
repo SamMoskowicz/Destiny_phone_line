@@ -4,6 +4,10 @@ services:
     env: docker
     dockerfilePath: ./Dockerfile
     plan: starter
+    disk:
+      name: destiny-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: STREAMER_NAME
         value: Destiny
@@ -20,4 +24,18 @@ services:
       - key: PUBLIC_BASE_URL
         sync: false
       - key: AI_SAFETY_SALT
-        sync: false
+        generateValue: true
+      - key: AI_MEMORY_ENABLED
+        value: "true"
+      - key: AI_MEMORY_FILE
+        value: /var/data/ai-memory.enc.json
+      - key: AI_MEMORY_ENCRYPTION_KEY
+        generateValue: true
+      - key: AI_MEMORY_RECENT_EXCHANGES
+        value: "10"
+      - key: AI_MEMORY_MAX_PENDING_SUMMARY
+        value: "10"
+      - key: AI_MEMORY_RETENTION_DAYS
+        value: "0"
+      - key: AI_CONSENT_FILE
+        value: /var/data/ai-consent.json

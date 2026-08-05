@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { formatAiSms, smsMetrics } = require('../src/smsUtils');
 
-const SMS_SUFFIX = '\nReply STOP to unsubscribe.';
+const SMS_SUFFIX = '\nReply DELETE to erase AI memory; STOP to unsubscribe.';
 
 test('GSM-7 metrics count extension-table characters and concatenated boundaries', () => {
     assert.deepEqual(smsMetrics('A'.repeat(160)), {
@@ -32,7 +32,7 @@ test('long GSM answers retain the compliance footer and fit exactly within three
     assert.equal(metrics.segments, 3);
     assert.ok(metrics.units <= 459);
     assert.match(message, /^ChatGPT: /);
-    assert.match(message, /\.\.\.\nReply STOP to unsubscribe\.$/);
+    assert.match(message, /\.\.\.\nReply DELETE to erase AI memory; STOP to unsubscribe\.$/);
     assert.ok(message.endsWith(SMS_SUFFIX));
 });
 

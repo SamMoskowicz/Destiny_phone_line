@@ -36,7 +36,7 @@ function smsMetrics(value) {
 
 function formatAiSms(answer, { maxSegments = 3 } = {}) {
     const prefix = 'ChatGPT: ';
-    const suffix = '\nReply STOP to unsubscribe.';
+    const suffix = '\nReply DELETE to erase AI memory; STOP to unsubscribe.';
     const body = String(answer || '').trim().replace(/\n{3,}/g, '\n\n');
     const complete = `${prefix}${body}${suffix}`;
     const segmentLimit = Math.max(1, Math.min(10, Number(maxSegments) || 3));

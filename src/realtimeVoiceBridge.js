@@ -1,10 +1,16 @@
+const crypto = require('crypto');
 const { WebSocket, WebSocketServer } = require('ws');
+const {
+    addMemoryRules,
+    buildMemoryContextMessage,
+    buildMemoryTransparencyInstructions
+} = require('./aiService');
 
 const OPEN = WebSocket.OPEN;
 const CONNECTING = WebSocket.CONNECTING;
 const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime';
 
-const DEFAULT_INSTRUCTIONS = `You are a highly capable general AI assistant speaking on a live
+const BASE_INSTRUCTIONS = `You are ChatGPT, a highly capable general AI assistant speaking on a live
 phone call. Respond naturally and start with the answer. For greetings, simple facts, and easy
 questions, answer directly in one to three concise sentences. For a question that needs careful
 multi-step reasoning, calculation, comparison, coding analysis, or important medical, legal, or
@@ -13,12 +19,20 @@ mention tools or internal reasoning. Do not claim to have live web access. Let t
 handle interruptions gracefully, and ask one short clarifying question only when it is necessary.
 Always finish the current sentence before ending a response. If the answer must be shortened,
 omit secondary details instead of stopping partway through a sentence.`;
+const DEFAULT_INSTRUCTIONS = `${BASE_INSTRUCTIONS}
+${buildMemoryTransparencyInstructions()}`;
 
-const CONTINUATION_INSTRUCTIONS = `${DEFAULT_INSTRUCTIONS}
-For this response only, continue the immediately preceding spoken answer exactly where it stopped
+const CONTINUATION_SUFFIX = `For this response only, continue the immediately preceding spoken answer exactly where it stopped
 and do not call a tool. Do not restart, repeat, summarize, apologize, or mention an output limit.
 First finish the interrupted sentence, then complete any essential remaining answer. End only after
 a complete sentence.`;
+const CONTINUATION_INSTRUCTIONS = `${DEFAULT_INSTRUCTIONS}
+${CONTINUATION_SUFFIX}`;
+
+const INITIAL_GREETING_PURPOSE = 'initial_greeting';
+const INITIAL_GREETING_INSTRUCTIONS = `Say exactly this short, natural greeting: "Hi! You're
+speaking with ChatGPT. What would you like to talk about?" Do not add anything else and do not call
+a tool.`;
 
 function asInteger(value, fallback, minimum, maximum) {
     const number = Number(value);
@@ -251,6 +265,14 @@ class RealtimeVoiceBridge {
         return this.sessions.size;
     }
 
+    buildInstructions() {
+        const memoryStore = this.aiService?.memoryStore;
+        return `${BASE_INSTRUCTIONS}\n${buildMemoryTransparencyInstructions({
+            persistentMemory: Boolean(memoryStore?.isConfigured?.()),
+            retentionDays: memoryStore?.retentionDays
+        })}`;
+    }
+
     isConfigured() {
         return Boolean(
             this.apiKey
@@ -307,12 +329,22 @@ class RealtimeVoiceBridge {
             callSid: null,
             streamSid: null,
             safetyIdentifier: null,
+            memoryGeneration: 0,
+            memoryContext: '',
+            memoryContextAdded: false,
+            memorySessionId: crypto.randomBytes(12).toString('hex'),
+            discardMemory: false,
             pendingAudio: [],
             pendingAudioBytes: 0,
             transcripts: [],
+            inputItemEpochs: new Map(),
+            voiceTurns: new Map(),
+            finalizedResponses: new Map(),
             handledCallIds: new Set(),
             interruptedItemIds: new Set(),
+            playedAssistantItemIds: new Set(),
             responseStates: new Map(),
+            initialGreetingRequested: false,
             currentItemId: null,
             audioStartedAt: null,
             latestMediaTimestamp: null,
@@ -452,6 +484,11 @@ class RealtimeVoiceBridge {
         state.callSid = callSid;
         state.streamSid = streamSid;
         state.safetyIdentifier = tokenEntry.safetyIdentifier;
+        const memorySnapshot = this.aiService?.getMemorySnapshot?.(state.safetyIdentifier);
+        if (memorySnapshot && typeof memorySnapshot === 'object') {
+            state.memoryGeneration = Number(memorySnapshot.generation) || 0;
+            state.memoryContext = String(memorySnapshot.context || '');
+        }
         this.pendingStates.delete(state);
         this.sessions.set(callSid, state);
         this.activeByUser.set(state.safetyIdentifier, callSid);
@@ -503,6 +540,7 @@ class RealtimeVoiceBridge {
                 reasoningEffort: this.reasoningEffort,
                 transcriptionModel: this.transcriptionModel,
                 vadMode: this.vadMode,
+                instructions: addMemoryRules(this.buildInstructions(), state.memoryContext),
                 enableDeepTool: Boolean(this.aiService?.isConfigured?.())
             });
             if (!sendJson(socket, update, this.maxBufferedBytes)) {
@@ -582,6 +620,29 @@ class RealtimeVoiceBridge {
             this.beginAssistantItem(state, event.item.id);
         } else if (event.type === 'response.output_audio.delta') {
             this.forwardAssistantAudio(state, event);
+        } else if (event.type === 'response.output_audio_transcript.done'
+            || event.type === 'response.audio_transcript.done') {
+            this.captureAssistantTranscript(state, {
+                responseId: event.response_id,
+                itemId: event.item_id,
+                contentIndex: event.content_index,
+                text: event.transcript
+            });
+        } else if (event.type === 'response.output_text.done') {
+            this.captureAssistantTranscript(state, {
+                responseId: event.response_id,
+                itemId: event.item_id,
+                contentIndex: event.content_index,
+                text: event.text
+            });
+        } else if (event.type === 'input_audio_buffer.committed') {
+            const itemId = String(event.item_id || '').trim();
+            if (itemId) {
+                state.inputItemEpochs.set(itemId, state.turnEpoch);
+                while (state.inputItemEpochs.size > 50) {
+                    state.inputItemEpochs.delete(state.inputItemEpochs.keys().next().value);
+                }
+            }
         } else if (event.type === 'input_audio_buffer.speech_started') {
             state.turnEpoch += 1;
             state.continuationCount = 0;
@@ -606,7 +667,10 @@ class RealtimeVoiceBridge {
             if (transcript) {
                 state.transcripts.push(transcript.slice(0, 1200));
                 state.transcripts = state.transcripts.slice(-6);
+                this.captureCallerTranscript(state, event, transcript);
             }
+        } else if (event.type === 'conversation.item.truncated') {
+            this.removeInterruptedAssistantTranscript(state, event.item_id);
         } else if (event.type === 'response.done') {
             this.handleResponseDone(state, event);
         } else if (event.type === 'error') {
@@ -626,6 +690,21 @@ class RealtimeVoiceBridge {
         clearTimeout(state.sessionReadyTimer);
         state.sessionReadyTimer = null;
         state.openAiReady = true;
+        const memoryMessage = buildMemoryContextMessage(state.memoryContext);
+        if (memoryMessage && !state.memoryContextAdded) {
+            if (!sendJson(state.openAiSocket, {
+                type: 'conversation.item.create',
+                item: {
+                    type: 'message',
+                    role: 'user',
+                    content: [{ type: 'input_text', text: memoryMessage }]
+                }
+            }, this.maxBufferedBytes)) {
+                this.finish(state, { code: 1011, reason: 'AI backpressure', closeTwilio: true, closeOpenAi: true });
+                return;
+            }
+            state.memoryContextAdded = true;
+        }
         for (const audio of state.pendingAudio) {
             if (!sendJson(state.openAiSocket, { type: 'input_audio_buffer.append', audio }, this.maxBufferedBytes)) {
                 this.finish(state, { code: 1011, reason: 'AI backpressure', closeTwilio: true, closeOpenAi: true });
@@ -634,6 +713,187 @@ class RealtimeVoiceBridge {
         }
         state.pendingAudio = [];
         state.pendingAudioBytes = 0;
+        if (!state.initialGreetingRequested) {
+            const greetingEpoch = state.turnEpoch;
+            if (!sendJson(state.openAiSocket, {
+                type: 'response.create',
+                response: {
+                    conversation: 'auto',
+                    output_modalities: ['audio'],
+                    instructions: INITIAL_GREETING_INSTRUCTIONS,
+                    max_output_tokens: 80,
+                    tools: [],
+                    tool_choice: 'none',
+                    metadata: {
+                        response_purpose: INITIAL_GREETING_PURPOSE,
+                        turn_epoch: String(greetingEpoch)
+                    }
+                }
+            }, this.maxBufferedBytes)) {
+                this.finish(state, { code: 1011, reason: 'AI backpressure', closeTwilio: true, closeOpenAi: true });
+                return;
+            }
+            state.initialGreetingRequested = true;
+        }
+    }
+
+    getVoiceTurn(state, turnEpoch) {
+        const epoch = Number.isSafeInteger(Number(turnEpoch)) && Number(turnEpoch) >= 0
+            ? Number(turnEpoch)
+            : state.turnEpoch;
+        if (!state.voiceTurns.has(epoch)) {
+            state.voiceTurns.set(epoch, {
+                userParts: new Map(),
+                assistantParts: new Map()
+            });
+        }
+        return { epoch, turn: state.voiceTurns.get(epoch) };
+    }
+
+    captureCallerTranscript(state, event, transcript) {
+        const itemId = String(event.item_id || '').trim();
+        const mappedEpoch = itemId ? state.inputItemEpochs.get(itemId) : undefined;
+        const { turn } = this.getVoiceTurn(state, mappedEpoch ?? state.turnEpoch);
+        const key = `${itemId || 'unknown'}:${Number(event.content_index) || 0}`;
+        turn.userParts.set(key, String(transcript).slice(0, 16000));
+    }
+
+    captureAssistantTranscript(state, {
+        responseId,
+        itemId,
+        contentIndex = 0,
+        text
+    } = {}) {
+        const transcript = String(text || '').trim().slice(0, 16000);
+        const normalizedResponseId = String(responseId || '').trim();
+        const normalizedItemId = String(itemId || '').trim();
+        if (!transcript || (normalizedItemId && state.interruptedItemIds.has(normalizedItemId))) {
+            return;
+        }
+        const responseState = normalizedResponseId ? state.responseStates.get(normalizedResponseId) : null;
+        const finalized = normalizedResponseId ? state.finalizedResponses.get(normalizedResponseId) : null;
+        if (responseState?.purpose === INITIAL_GREETING_PURPOSE) {
+            return;
+        }
+        if (finalized && !finalized.keep) {
+            return;
+        }
+        if (responseState && responseState.turnEpoch !== state.turnEpoch) {
+            return;
+        }
+        const turnEpoch = responseState?.turnEpoch ?? finalized?.turnEpoch ?? state.turnEpoch;
+        const { turn } = this.getVoiceTurn(state, turnEpoch);
+        const key = `${normalizedResponseId || 'unknown'}:${normalizedItemId || 'unknown'}:${Number(contentIndex) || 0}`;
+        turn.assistantParts.set(key, {
+            responseId: normalizedResponseId,
+            itemId: normalizedItemId,
+            text: transcript,
+            status: finalized?.status || 'pending'
+        });
+    }
+
+    removeInterruptedAssistantTranscript(state, itemId) {
+        const normalizedItemId = String(itemId || '').trim();
+        if (!normalizedItemId) {
+            return;
+        }
+        for (const turn of state.voiceTurns.values()) {
+            for (const [key, part] of turn.assistantParts) {
+                if (part.itemId === normalizedItemId) {
+                    turn.assistantParts.delete(key);
+                }
+            }
+        }
+    }
+
+    finalizeResponseMemory(state, response) {
+        const responseId = String(response?.id || '').trim();
+        const responseState = responseId ? state.responseStates.get(responseId) : null;
+        const turnEpoch = responseState?.turnEpoch ?? state.turnEpoch;
+        const isCurrentResponse = !responseState || responseState.turnEpoch === state.turnEpoch;
+        const responsePurpose = responseState?.purpose || String(response?.metadata?.response_purpose || '');
+        const incompleteReason = response?.status_details?.reason || response?.incomplete_details?.reason;
+        const keep = responsePurpose !== INITIAL_GREETING_PURPOSE && isCurrentResponse && (
+            response?.status === 'completed'
+            || (response?.status === 'incomplete' && incompleteReason === 'max_output_tokens')
+        );
+
+        if (keep) {
+            for (const item of Array.isArray(response?.output) ? response.output : []) {
+                if (item?.type !== 'message') {
+                    continue;
+                }
+                for (let index = 0; index < (Array.isArray(item.content) ? item.content.length : 0); index += 1) {
+                    const content = item.content[index];
+                    const transcript = ['audio', 'output_audio'].includes(content?.type)
+                        ? content.transcript
+                        : content?.type === 'output_text'
+                            ? content.text
+                            : '';
+                    this.captureAssistantTranscript(state, {
+                        responseId,
+                        itemId: item.id,
+                        contentIndex: index,
+                        text: transcript
+                    });
+                }
+            }
+        }
+
+        for (const turn of state.voiceTurns.values()) {
+            for (const [key, part] of turn.assistantParts) {
+                if (part.responseId !== responseId) {
+                    continue;
+                }
+                if (keep) {
+                    part.status = response.status;
+                } else {
+                    turn.assistantParts.delete(key);
+                }
+            }
+        }
+        if (responseId) {
+            state.finalizedResponses.set(responseId, {
+                turnEpoch,
+                status: String(response.status || 'unknown'),
+                keep
+            });
+            while (state.finalizedResponses.size > 30) {
+                state.finalizedResponses.delete(state.finalizedResponses.keys().next().value);
+            }
+        }
+    }
+
+    persistVoiceMemory(state) {
+        if (state.discardMemory || !state.safetyIdentifier || !this.aiService?.recordConversationExchange) {
+            return;
+        }
+        for (const [turnEpoch, turn] of Array.from(state.voiceTurns.entries()).sort((a, b) => a[0] - b[0])) {
+            const userText = Array.from(turn.userParts.values()).join('\n').trim();
+            if (!userText) {
+                continue;
+            }
+            const assistantText = Array.from(turn.assistantParts.values())
+                .filter((part) => (
+                    ['completed', 'incomplete'].includes(part.status)
+                    && part.itemId
+                    && state.playedAssistantItemIds.has(part.itemId)
+                ))
+                .map((part) => part.text)
+                .join(' ')
+                .trim();
+            const saved = this.aiService.recordConversationExchange({
+                safetyIdentifier: state.safetyIdentifier,
+                exchangeId: `voice-${state.memorySessionId}-${turnEpoch}`,
+                channel: 'voice',
+                userText,
+                assistantText,
+                expectedGeneration: state.memoryGeneration
+            });
+            if (saved === false) {
+                this.logWarning('memory_write_failed');
+            }
+        }
     }
 
     beginAssistantItem(state, itemId) {
@@ -643,7 +903,6 @@ class RealtimeVoiceBridge {
         state.audioSentMs = 0;
         state.confirmedPlayedMs = 0;
         state.bytesSinceMark = 0;
-        state.pendingMarks.clear();
     }
 
     trackResponseCreated(state, response) {
@@ -655,6 +914,7 @@ class RealtimeVoiceBridge {
             turnEpoch: Number.isSafeInteger(metadataEpoch) && metadataEpoch >= 0
                 ? metadataEpoch
                 : state.turnEpoch,
+            purpose: String(response.metadata?.response_purpose || ''),
             hasAudio: false
         });
         while (state.responseStates.size > 30) {
@@ -705,29 +965,55 @@ class RealtimeVoiceBridge {
         }
 
         if (state.bytesSinceMark >= 6400) {
-            state.markSequence += 1;
-            const name = `ai-${state.markSequence}`;
-            if (sendJson(state.twilioSocket, {
-                event: 'mark',
-                streamSid: state.streamSid,
-                mark: { name }
-            }, this.maxBufferedBytes)) {
-                state.pendingMarks.set(name, state.audioSentMs);
-                state.bytesSinceMark = 0;
-            }
+            this.sendPlaybackMark(state);
         }
     }
 
+    sendPlaybackMark(state, final = false) {
+        state.markSequence += 1;
+        const name = `ai-${state.markSequence}`;
+        if (!sendJson(state.twilioSocket, {
+            event: 'mark',
+            streamSid: state.streamSid,
+            mark: { name }
+        }, this.maxBufferedBytes)) {
+            return false;
+        }
+        state.pendingMarks.set(name, {
+            playedMs: state.audioSentMs,
+            itemId: state.currentItemId,
+            final
+        });
+        state.bytesSinceMark = 0;
+        return true;
+    }
+
     acknowledgeMark(state, name) {
-        const playedMs = state.pendingMarks.get(String(name || ''));
-        if (playedMs === undefined) {
+        const normalizedName = String(name || '');
+        const mark = state.pendingMarks.get(normalizedName);
+        if (!mark) {
             return;
         }
-        state.confirmedPlayedMs = Math.max(state.confirmedPlayedMs, playedMs);
-        for (const [markName, markMs] of state.pendingMarks) {
-            if (markMs <= playedMs) {
-                state.pendingMarks.delete(markName);
+
+        let clearCurrentItem = false;
+        for (const [markName, pendingMark] of state.pendingMarks) {
+            state.pendingMarks.delete(markName);
+            if (pendingMark.itemId === state.currentItemId) {
+                state.confirmedPlayedMs = Math.max(state.confirmedPlayedMs, pendingMark.playedMs);
             }
+            if (pendingMark.final && pendingMark.itemId) {
+                state.playedAssistantItemIds.add(pendingMark.itemId);
+                if (pendingMark.itemId === state.currentItemId
+                    && pendingMark.playedMs >= state.audioSentMs) {
+                    clearCurrentItem = true;
+                }
+            }
+            if (markName === normalizedName) {
+                break;
+            }
+        }
+        if (clearCurrentItem) {
+            this.beginAssistantItem(state, null);
         }
     }
 
@@ -764,14 +1050,19 @@ class RealtimeVoiceBridge {
             return;
         }
         state.interruptedItemIds.add(state.currentItemId);
+        this.removeInterruptedAssistantTranscript(state, state.currentItemId);
         while (state.interruptedItemIds.size > 20) {
             state.interruptedItemIds.delete(state.interruptedItemIds.values().next().value);
         }
+        // Twilio returns queued marks after a clear. Forget them first so those
+        // acknowledgements cannot make interrupted audio eligible for memory.
+        state.pendingMarks.clear();
         this.beginAssistantItem(state, null);
     }
 
     handleResponseDone(state, event) {
         const response = event.response || {};
+        this.finalizeResponseMemory(state, response);
         const responseState = response.id ? state.responseStates.get(response.id) : null;
         const isCurrentResponse = !responseState || responseState.turnEpoch === state.turnEpoch;
         const hasAudio = Boolean(responseState?.hasAudio || responseContainsAudio(response));
@@ -795,17 +1086,19 @@ class RealtimeVoiceBridge {
         if (response.status === 'incomplete') {
             const reason = response.status_details?.reason || 'unknown';
             this.logWarning('openai_response_incomplete', reason);
+            let requestedContinuation = false;
             if (reason === 'max_output_tokens'
                 && isCurrentResponse
                 && hasAudio
+                && responseState?.purpose !== INITIAL_GREETING_PURPOSE
                 && state.continuationCount < this.maxContinuations) {
                 state.continuationCount += 1;
-                if (!sendJson(state.openAiSocket, {
+                requestedContinuation = sendJson(state.openAiSocket, {
                     type: 'response.create',
                     response: {
                         conversation: 'auto',
                         output_modalities: ['audio'],
-                        instructions: CONTINUATION_INSTRUCTIONS,
+                        instructions: `${this.buildInstructions()}\n${CONTINUATION_SUFFIX}`,
                         max_output_tokens: 'inf',
                         tools: [],
                         tool_choice: 'none',
@@ -816,7 +1109,8 @@ class RealtimeVoiceBridge {
                             continuation_depth: String(state.continuationCount)
                         }
                     }
-                }, this.maxBufferedBytes)) {
+                }, this.maxBufferedBytes);
+                if (!requestedContinuation) {
                     this.finish(state, {
                         code: 1011,
                         reason: 'AI backpressure',
@@ -825,10 +1119,17 @@ class RealtimeVoiceBridge {
                     });
                 }
             }
+            if (isCurrentResponse && hasAudio && !this.sendPlaybackMark(state, true)) {
+                this.finish(state, { code: 1011, reason: 'call backpressure', closeTwilio: true, closeOpenAi: true });
+            }
             return;
         }
         if (response.status !== 'completed') {
             this.logWarning('openai_response_cancelled', response.status_details?.reason || response.status);
+            return;
+        }
+        if (isCurrentResponse && hasAudio && !this.sendPlaybackMark(state, true)) {
+            this.finish(state, { code: 1011, reason: 'call backpressure', closeTwilio: true, closeOpenAi: true });
             return;
         }
         if (isCurrentResponse) {
@@ -984,6 +1285,7 @@ class RealtimeVoiceBridge {
         }
         state.finished = true;
         state.phase = 'finished';
+        this.persistVoiceMemory(state);
         this.pendingStates.delete(state);
         clearTimeout(state.startTimer);
         clearTimeout(state.durationTimer);
@@ -1002,8 +1304,12 @@ class RealtimeVoiceBridge {
         state.pendingTurnDuringTool = false;
         state.pendingAudio = [];
         state.transcripts = [];
+        state.inputItemEpochs.clear();
+        state.voiceTurns.clear();
+        state.finalizedResponses.clear();
         state.handledCallIds.clear();
         state.interruptedItemIds.clear();
+        state.playedAssistantItemIds.clear();
         state.responseStates.clear();
         state.pendingMarks.clear();
         state.currentItemId = null;
@@ -1013,6 +1319,22 @@ class RealtimeVoiceBridge {
         if (closeTwilio) {
             closeSocket(state.twilioSocket, code, reason);
         }
+    }
+
+    forgetUser(safetyIdentifier) {
+        const callSid = this.activeByUser.get(String(safetyIdentifier || ''));
+        const state = callSid ? this.sessions.get(callSid) : null;
+        if (!state) {
+            return false;
+        }
+        state.discardMemory = true;
+        this.finish(state, {
+            code: 1000,
+            reason: 'memory deleted',
+            closeTwilio: true,
+            closeOpenAi: true
+        });
+        return true;
     }
 
     logWarning(event, code = undefined) {
