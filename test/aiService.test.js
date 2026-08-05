@@ -83,7 +83,7 @@ test('text chat uses GPT-5.6 Sol Fast mode and bounded in-memory history', async
         search_context_size: 'low'
     }]);
     assert.equal(client.calls[0].params.tool_choice, 'auto');
-    assert.equal(client.calls[0].params.max_tool_calls, 5);
+    assert.equal(client.calls[0].params.max_tool_calls, 20);
     assert.equal(client.calls[0].params.safety_identifier, 'usr_hash');
     assert.equal(client.calls[0].params.store, false);
     assert.match(client.calls[0].params.instructions, /through SMS text messages/i);
@@ -220,7 +220,7 @@ test('deep voice answers use the frontier model without storing the response', a
         search_context_size: 'low'
     }]);
     assert.equal(client.calls[0].params.tool_choice, 'auto');
-    assert.equal(client.calls[0].params.max_tool_calls, 5);
+    assert.equal(client.calls[0].params.max_tool_calls, 20);
     assert.match(client.calls[0].params.instructions, /current,\s+recent/i);
     assert.match(client.calls[0].params.instructions, /do not read URLs/i);
     assert.match(client.calls[0].params.input, /Recent conversation context/);
@@ -473,8 +473,11 @@ test('invalid timeout and odd history configuration are normalized safely', asyn
         maxHistoryMessages: 3
     });
     assert.equal(service.textTimeoutMs, 12000);
-    assert.equal(service.deepVoiceTimeoutMs, 10000);
+    assert.equal(service.deepVoiceTimeoutMs, 30000);
     assert.equal(service.maxHistoryMessages, 2);
+
+    assert.equal(new AiService({ client, deepVoiceTimeoutMs: 40000 }).deepVoiceTimeoutMs, 40000);
+    assert.equal(new AiService({ client, deepVoiceTimeoutMs: 60000 }).deepVoiceTimeoutMs, 45000);
 
     await service.replyToText({ safetyIdentifier: 'usr_hash', text: 'first' });
     await service.replyToText({ safetyIdentifier: 'usr_hash', text: 'second' });

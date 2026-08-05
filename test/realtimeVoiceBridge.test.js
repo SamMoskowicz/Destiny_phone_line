@@ -146,6 +146,7 @@ test('session update configures PCMU, transcription, VAD, reasoning, and the dee
     assert.equal(event.session.audio.output.format.type, 'audio/pcmu');
     assert.equal(event.session.audio.input.transcription.model, 'gpt-transcribe');
     assert.equal(event.session.audio.input.turn_detection.silence_duration_ms, 350);
+    assert.equal(event.session.audio.input.turn_detection.idle_timeout_ms, 15000);
     assert.deepEqual(event.session.reasoning, { effort: 'low' });
     assert.equal(event.session.max_output_tokens, 'inf');
     assert.equal(event.session.tools[0].name, 'answer_complex_question');
@@ -1021,6 +1022,12 @@ test('difficult-question tool results and usage are returned to Realtime', async
         && event.type === 'session.update'
         && event.session?.audio?.input?.turn_detection?.create_response === true
     ));
+    assert.ok(disableIndex >= 0 && disableIndex < functionOutputIndex);
+    assert.ok(enableIndex > functionOutputIndex);
+    assert.equal(
+        upstream.sent[disableIndex].session.audio.input.turn_detection.idle_timeout_ms,
+        null
+    );
     assert.deepEqual(upstream.sent[functionOutputIndex], {
         type: 'conversation.item.create',
         item: {
@@ -1029,9 +1036,52 @@ test('difficult-question tool results and usage are returned to Realtime', async
             output: JSON.stringify({ answer: 'Use the second approach.', searched: true })
         }
     });
-    assert.ok(disableIndex >= 0 && disableIndex < functionOutputIndex);
-    assert.ok(enableIndex > functionOutputIndex);
+    assert.equal(
+        upstream.sent[enableIndex].session.audio.input.turn_detection.idle_timeout_ms,
+        15000
+    );
     assert.deepEqual(upstream.sent.at(-1), { type: 'response.create' });
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('idle timeout events are ignored while a deep answer is still running', async () => {
+    const { bridge, upstream, twilioSocket, aiService, state } = createHarness();
+    let resolveDeepAnswer;
+    aiService.answerComplexVoice = (args) => {
+        aiService.calls.push(args);
+        aiService.lastArgs = args;
+        return new Promise((resolve) => {
+            resolveDeepAnswer = resolve;
+        });
+    };
+    completeSetup(upstream);
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            status: 'completed',
+            output: [{
+                type: 'function_call',
+                name: 'answer_complex_question',
+                call_id: 'slow-search-call',
+                arguments: JSON.stringify({ question: 'What is happening in the market today?' })
+            }]
+        }
+    });
+
+    assert.equal(state.deepToolInFlight, true);
+    upstream.receive({ type: 'input_audio_buffer.timeout_triggered' });
+    assert.equal(state.idlePromptCount, 0);
+    assert.equal(state.finished, false);
+
+    resolveDeepAnswer({ answer: 'Markets are mixed today.', usageTokens: 10, searched: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(state.deepToolInFlight, false);
+    assert.equal(
+        JSON.parse(upstream.sent.find((event) => event.item?.call_id === 'slow-search-call').item.output).answer,
+        'Markets are mixed today.'
+    );
+
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     bridge.close();
 });

@@ -316,7 +316,7 @@ class AiService {
         fastMode = process.env.OPENAI_FAST_MODE !== 'false',
         webSearchEnabled = process.env.OPENAI_WEB_SEARCH_ENABLED !== 'false',
         textTimeoutMs = process.env.OPENAI_TEXT_TIMEOUT_MS || 12000,
-        deepVoiceTimeoutMs = process.env.OPENAI_DEEP_VOICE_TIMEOUT_MS || 10000,
+        deepVoiceTimeoutMs = process.env.OPENAI_DEEP_VOICE_TIMEOUT_MS || 30000,
         textMaxCharacters = process.env.AI_SMS_MAX_CHARACTERS || 600,
         historyTtlMs = process.env.AI_TEXT_HISTORY_TTL_MS || 30 * 60 * 1000,
         maxHistoryMessages = process.env.AI_TEXT_HISTORY_MESSAGES || 8,
@@ -327,7 +327,7 @@ class AiService {
     } = {}) {
         this.apiKey = apiKey || null;
         this.textTimeoutMs = clampInteger(textTimeoutMs, 12000, 500, 15000);
-        this.deepVoiceTimeoutMs = clampInteger(deepVoiceTimeoutMs, 10000, 500, 10000);
+        this.deepVoiceTimeoutMs = clampInteger(deepVoiceTimeoutMs, 30000, 500, 45000);
         this.client = client || (this.apiKey ? new OpenAI({
             apiKey: this.apiKey,
             baseURL: OPENAI_API_BASE_URL,

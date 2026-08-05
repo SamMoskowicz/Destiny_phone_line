@@ -84,7 +84,7 @@ function buildTurnDetection(vadMode, createResponse = true) {
             silence_duration_ms: 350,
             create_response: createResponse,
             interrupt_response: true,
-            idle_timeout_ms: 15000
+            idle_timeout_ms: createResponse ? 15000 : null
         };
 }
 
@@ -651,9 +651,11 @@ class RealtimeVoiceBridge {
                 this.finish(state, { code: 1000, reason: 'turn limit', closeTwilio: true, closeOpenAi: true });
             }
         } else if (event.type === 'input_audio_buffer.timeout_triggered') {
-            state.idlePromptCount += 1;
-            if (state.idlePromptCount > this.maxIdlePrompts) {
-                this.finish(state, { code: 1000, reason: 'idle limit', closeTwilio: true, closeOpenAi: true });
+            if (!state.deepToolInFlight) {
+                state.idlePromptCount += 1;
+                if (state.idlePromptCount > this.maxIdlePrompts) {
+                    this.finish(state, { code: 1000, reason: 'idle limit', closeTwilio: true, closeOpenAi: true });
+                }
             }
         } else if (event.type === 'conversation.item.input_audio_transcription.completed') {
             const transcript = String(event.transcript || '').trim();
@@ -1218,7 +1220,7 @@ class RealtimeVoiceBridge {
                     this.logWarning('deep_voice_answer_failed', error?.code || error?.status);
                 }
                 answer = error?.code === 'AI_TIMEOUT'
-                    ? 'I could not finish the deeper analysis within a few seconds. Try asking for a shorter answer or split the question into parts.'
+                    ? 'I could not finish the deeper analysis within the time limit. Try asking for a shorter answer or split the question into parts.'
                     : 'I could not complete the deeper analysis just now. Please try that question again.';
             } finally {
                 if (state.deepToolAbortController === controller) {
