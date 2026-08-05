@@ -13,6 +13,9 @@ function fakeClient(outputs) {
                 if (output instanceof Error) {
                     throw output;
                 }
+                if (output && typeof output === 'object') {
+                    return output;
+                }
                 return { output_text: output };
             }
         }
@@ -40,6 +43,8 @@ test('text chat uses GPT-5.6 Sol Fast mode and bounded in-memory history', async
     assert.deepEqual(client.calls[0].params.reasoning, { effort: 'low', context: 'current_turn' });
     assert.equal(client.calls[0].params.safety_identifier, 'usr_hash');
     assert.equal(client.calls[0].params.store, false);
+    assert.match(client.calls[0].params.instructions, /through SMS text messages/i);
+    assert.match(client.calls[0].params.instructions, /not a voice\s+call/i);
     assert.deepEqual(client.calls[1].params.input, [
         { role: 'user', content: 'First question' },
         { role: 'assistant', content: 'First answer' },
@@ -61,7 +66,56 @@ test('deep voice answers use the frontier model without storing the response', a
     assert.equal(client.calls[0].params.model, 'gpt-5.6-sol');
     assert.deepEqual(client.calls[0].params.reasoning, { effort: 'medium', context: 'current_turn' });
     assert.match(client.calls[0].params.input, /Recent conversation context/);
+    assert.equal(Object.hasOwn(client.calls[0].params, 'max_output_tokens'), false);
     assert.equal(client.calls[0].params.store, false);
+});
+
+test('deep voice answers are not clipped to a character limit', async () => {
+    const longAnswer = 'This is a complete spoken sentence. '.repeat(60).trim();
+    assert.ok(longAnswer.length > 1400);
+    const client = fakeClient([longAnswer]);
+    const service = new AiService({ client });
+
+    const result = await service.answerComplexVoice({
+        safetyIdentifier: 'usr_hash',
+        question: 'Give me a detailed explanation.'
+    });
+
+    assert.equal(result.answer, longAnswer);
+    assert.ok(result.answer.length > 1400);
+});
+
+test('an incomplete deep answer keeps only complete spoken sentences', async () => {
+    const client = fakeClient([{
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output_text: 'This sentence is complete. This sentence was cut off halfway'
+    }]);
+    const service = new AiService({ client });
+
+    const result = await service.answerComplexVoice({
+        safetyIdentifier: 'usr_hash',
+        question: 'Give me a detailed explanation.'
+    });
+
+    assert.equal(result.answer, 'This sentence is complete.');
+});
+
+test('a content-filtered deep answer is not passed through as speech', async () => {
+    const client = fakeClient([{
+        status: 'incomplete',
+        incomplete_details: { reason: 'content_filter' },
+        output_text: 'Partial filtered output.'
+    }]);
+    const service = new AiService({ client });
+
+    await assert.rejects(
+        service.answerComplexVoice({
+            safetyIdentifier: 'usr_hash',
+            question: 'Give me a detailed explanation.'
+        }),
+        (error) => error.code === 'AI_INCOMPLETE_RESPONSE'
+    );
 });
 
 test('SMS output is clipped cleanly to the configured length', () => {

@@ -35,7 +35,7 @@ function smsMetrics(value) {
 }
 
 function formatAiSms(answer, { maxSegments = 3 } = {}) {
-    const prefix = 'Destiny AI: ';
+    const prefix = 'ChatGPT: ';
     const suffix = '\nReply STOP to unsubscribe.';
     const body = String(answer || '').trim().replace(/\n{3,}/g, '\n\n');
     const complete = `${prefix}${body}${suffix}`;

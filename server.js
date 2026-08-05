@@ -868,7 +868,7 @@ async function handleSmsRequest(req, res, body) {
     }
     if (['HELP', 'INFO'].includes(keyword)) {
         if (safetyIdentifier && smsNoticeLimiter.consume(safetyIdentifier).allowed) {
-            sendSmsReply(res, messageSid, 'Destiny AI answers questions sent to this number. Reply STOP to unsubscribe.');
+            sendSmsReply(res, messageSid, 'ChatGPT answers questions sent to this number. Reply STOP to unsubscribe.');
         } else {
             sendTwiml(res, buildSmsTwiML());
         }

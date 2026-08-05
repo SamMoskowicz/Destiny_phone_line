@@ -10,7 +10,15 @@ questions, answer directly in one to three concise sentences. For a question tha
 multi-step reasoning, calculation, comparison, coding analysis, or important medical, legal, or
 financial nuance, call answer_complex_question exactly once, then speak its result clearly. Do not
 mention tools or internal reasoning. Do not claim to have live web access. Let the caller finish,
-handle interruptions gracefully, and ask one short clarifying question only when it is necessary.`;
+handle interruptions gracefully, and ask one short clarifying question only when it is necessary.
+Always finish the current sentence before ending a response. If the answer must be shortened,
+omit secondary details instead of stopping partway through a sentence.`;
+
+const CONTINUATION_INSTRUCTIONS = `${DEFAULT_INSTRUCTIONS}
+For this response only, continue the immediately preceding spoken answer exactly where it stopped
+and do not call a tool. Do not restart, repeat, summarize, apologize, or mention an output limit.
+First finish the interrupted sentence, then complete any essential remaining answer. End only after
+a complete sentence.`;
 
 function asInteger(value, fallback, minimum, maximum) {
     const number = Number(value);
@@ -80,6 +88,15 @@ function isValidBase64(value, maxDecodedBytes = 4096) {
     }
 }
 
+function responseContainsAudio(response) {
+    const output = Array.isArray(response?.output) ? response.output : [];
+    return output.some((item) => (
+        item?.type === 'message'
+        && (Array.isArray(item.content) ? item.content : [])
+            .some((content) => ['audio', 'output_audio'].includes(content?.type))
+    ));
+}
+
 function buildSessionUpdate({
     voice = 'marin',
     reasoningEffort = 'low',
@@ -94,7 +111,7 @@ function buildSessionUpdate({
         output_modalities: ['audio'],
         parallel_tool_calls: false,
         reasoning: { effort: realtimeReasoningEffort(reasoningEffort) },
-        max_output_tokens: 512,
+        max_output_tokens: 'inf',
         audio: {
             input: {
                 format: { type: 'audio/pcmu' },
@@ -187,6 +204,7 @@ class RealtimeVoiceBridge {
         maxTurns = process.env.AI_VOICE_MAX_TURNS || 30,
         maxDeepToolCalls = process.env.AI_VOICE_MAX_DEEP_CALLS || 10,
         maxTokens = process.env.AI_VOICE_MAX_TOKENS || 50000,
+        maxContinuations = process.env.AI_VOICE_MAX_CONTINUATIONS || 2,
         maxIdlePrompts = process.env.AI_VOICE_MAX_IDLE_PROMPTS || 2,
         maxBufferedBytes = process.env.AI_VOICE_MAX_BUFFERED_BYTES || 1024 * 1024,
         maxPendingAudioBytes = process.env.AI_VOICE_MAX_PENDING_AUDIO_BYTES || 32768,
@@ -210,6 +228,7 @@ class RealtimeVoiceBridge {
         this.maxTurns = asInteger(maxTurns, 30, 1, 1000);
         this.maxDeepToolCalls = asInteger(maxDeepToolCalls, 10, 1, 100);
         this.maxTokens = asInteger(maxTokens, 50000, 1000, 1000000);
+        this.maxContinuations = asInteger(maxContinuations, 2, 0, 10);
         this.maxIdlePrompts = asInteger(maxIdlePrompts, 2, 0, 10);
         this.maxBufferedBytes = asInteger(maxBufferedBytes, 1024 * 1024, 65536, 16 * 1024 * 1024);
         this.maxPendingAudioBytes = asInteger(maxPendingAudioBytes, 32768, 4096, 1024 * 1024);
@@ -293,6 +312,7 @@ class RealtimeVoiceBridge {
             transcripts: [],
             handledCallIds: new Set(),
             interruptedItemIds: new Set(),
+            responseStates: new Map(),
             currentItemId: null,
             audioStartedAt: null,
             latestMediaTimestamp: null,
@@ -309,6 +329,7 @@ class RealtimeVoiceBridge {
             deepToolAbortController: null,
             pendingTurnDuringTool: false,
             totalTokens: 0,
+            continuationCount: 0,
             idlePromptCount: 0,
             finished: false,
             startTimer: null,
@@ -552,12 +573,18 @@ class RealtimeVoiceBridge {
 
         if (event.type === 'session.updated') {
             this.finishOpenAiSetup(state, event);
+        } else if (event.type === 'response.created') {
+            this.trackResponseCreated(state, event.response);
         } else if (event.type === 'response.output_item.added' && event.item?.type === 'message') {
+            if (this.isStaleResponse(state, event.response_id)) {
+                return;
+            }
             this.beginAssistantItem(state, event.item.id);
         } else if (event.type === 'response.output_audio.delta') {
             this.forwardAssistantAudio(state, event);
         } else if (event.type === 'input_audio_buffer.speech_started') {
             state.turnEpoch += 1;
+            state.continuationCount = 0;
             state.idlePromptCount = 0;
             state.deepToolAbortController?.abort('caller started a newer turn');
             this.handleBargeIn(state);
@@ -619,7 +646,37 @@ class RealtimeVoiceBridge {
         state.pendingMarks.clear();
     }
 
+    trackResponseCreated(state, response) {
+        if (!response?.id) {
+            return;
+        }
+        const metadataEpoch = Number(response.metadata?.turn_epoch);
+        state.responseStates.set(response.id, {
+            turnEpoch: Number.isSafeInteger(metadataEpoch) && metadataEpoch >= 0
+                ? metadataEpoch
+                : state.turnEpoch,
+            hasAudio: false
+        });
+        while (state.responseStates.size > 30) {
+            state.responseStates.delete(state.responseStates.keys().next().value);
+        }
+    }
+
+    isStaleResponse(state, responseId) {
+        const responseState = responseId ? state.responseStates.get(responseId) : null;
+        return Boolean(responseState && responseState.turnEpoch !== state.turnEpoch);
+    }
+
     forwardAssistantAudio(state, event) {
+        if (this.isStaleResponse(state, event.response_id)) {
+            return;
+        }
+        const responseState = event.response_id
+            ? state.responseStates.get(event.response_id)
+            : null;
+        if (responseState) {
+            responseState.hasAudio = true;
+        }
         if (event.item_id && state.interruptedItemIds.has(event.item_id)) {
             return;
         }
@@ -714,24 +771,70 @@ class RealtimeVoiceBridge {
     }
 
     handleResponseDone(state, event) {
-        const usage = event.response?.usage;
+        const response = event.response || {};
+        const responseState = response.id ? state.responseStates.get(response.id) : null;
+        const isCurrentResponse = !responseState || responseState.turnEpoch === state.turnEpoch;
+        const hasAudio = Boolean(responseState?.hasAudio || responseContainsAudio(response));
+        if (response.id) {
+            state.responseStates.delete(response.id);
+        }
+        const usage = response.usage;
         state.totalTokens += Number(usage?.total_tokens || 0);
         if (state.totalTokens > this.maxTokens) {
             this.finish(state, { code: 1000, reason: 'usage limit', closeTwilio: true, closeOpenAi: true });
             return;
         }
-        if (event.response?.status === 'failed') {
+        if (response.status === 'failed') {
             this.logWarning(
                 'openai_response_failed',
-                event.response?.status_details?.error?.code || event.response?.status_details?.reason
+                response.status_details?.error?.code || response.status_details?.reason
             );
             this.finish(state, { code: 1011, reason: 'AI response failed', closeTwilio: true, closeOpenAi: true });
             return;
         }
-        if (event.response?.status !== 'completed') {
+        if (response.status === 'incomplete') {
+            const reason = response.status_details?.reason || 'unknown';
+            this.logWarning('openai_response_incomplete', reason);
+            if (reason === 'max_output_tokens'
+                && isCurrentResponse
+                && hasAudio
+                && state.continuationCount < this.maxContinuations) {
+                state.continuationCount += 1;
+                if (!sendJson(state.openAiSocket, {
+                    type: 'response.create',
+                    response: {
+                        conversation: 'auto',
+                        output_modalities: ['audio'],
+                        instructions: CONTINUATION_INSTRUCTIONS,
+                        max_output_tokens: 'inf',
+                        tools: [],
+                        tool_choice: 'none',
+                        metadata: {
+                            response_purpose: 'max_token_continuation',
+                            source_response_id: String(response.id || 'unknown').slice(0, 512),
+                            turn_epoch: String(state.turnEpoch),
+                            continuation_depth: String(state.continuationCount)
+                        }
+                    }
+                }, this.maxBufferedBytes)) {
+                    this.finish(state, {
+                        code: 1011,
+                        reason: 'AI backpressure',
+                        closeTwilio: true,
+                        closeOpenAi: true
+                    });
+                }
+            }
             return;
         }
-        const calls = (event.response?.output || []).filter((item) => (
+        if (response.status !== 'completed') {
+            this.logWarning('openai_response_cancelled', response.status_details?.reason || response.status);
+            return;
+        }
+        if (isCurrentResponse) {
+            state.continuationCount = 0;
+        }
+        const calls = (Array.isArray(response.output) ? response.output : []).filter((item) => (
             item?.type === 'function_call'
             && item.name === 'answer_complex_question'
             && item.call_id
@@ -901,6 +1004,7 @@ class RealtimeVoiceBridge {
         state.transcripts = [];
         state.handledCallIds.clear();
         state.interruptedItemIds.clear();
+        state.responseStates.clear();
         state.pendingMarks.clear();
         state.currentItemId = null;
         if (closeOpenAi) {
@@ -939,6 +1043,7 @@ class RealtimeVoiceBridge {
 module.exports = {
     RealtimeVoiceBridge,
     DEFAULT_INSTRUCTIONS,
+    CONTINUATION_INSTRUCTIONS,
     buildSessionUpdate,
     isValidBase64,
     normalizeOpenAiRealtimeUrl,

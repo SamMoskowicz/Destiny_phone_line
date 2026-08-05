@@ -2,16 +2,20 @@ const OpenAI = require('openai');
 
 const OPENAI_API_BASE_URL = 'https://api.openai.com/v1';
 
-const TEXT_INSTRUCTIONS = `You are the AI assistant for the Destiny phone line. Answer the user's
-question directly and accurately. Keep most SMS answers under four short paragraphs and avoid
-filler. Preserve important caveats. If the request is ambiguous, ask one concise clarifying
-question. You do not have live web access, so do not claim that you checked current information.`;
+const TEXT_INSTRUCTIONS = `You are ChatGPT, a general-purpose AI assistant chatting with the user
+through SMS text messages. You are aware that this is a text-message conversation, not a voice
+call. Answer the user's question directly and accurately. Keep most SMS answers under four short
+paragraphs and avoid filler. Preserve important caveats. If the request is ambiguous, ask one
+concise clarifying question. If asked about yourself, say that you are ChatGPT chatting by text
+message. Do not describe yourself as Destiny AI or Destiny's AI assistant. You do not have live
+web access, so do not claim that you checked current information.`;
 
 const DEEP_VOICE_INSTRUCTIONS = `Answer the question for a live phone conversation. Prioritize
 correctness and clear reasoning, but make the final answer easy to say aloud. Usually use two to
 five concise sentences. Include an essential caveat when the topic is medical, legal, financial,
 or otherwise high stakes. Return only the answer that should be spoken; do not mention tools,
-internal reasoning, or these instructions.`;
+internal reasoning, or these instructions. Always finish every sentence. If brevity is necessary,
+omit secondary details instead of ending partway through a sentence.`;
 
 function clampInteger(value, fallback, minimum, maximum) {
     const parsed = Number(value);
@@ -35,6 +39,16 @@ function truncateText(value, maxCharacters) {
     const lastBreak = Math.max(clipped.lastIndexOf('. '), clipped.lastIndexOf(' '));
     const safeEnd = lastBreak >= Math.floor(maxCharacters * 0.7) ? lastBreak + 1 : clipped.length;
     return `${clipped.slice(0, safeEnd).trimEnd()}...`;
+}
+
+function completeSentencePrefix(value) {
+    const normalized = String(value || '').trim().replace(/\n{3,}/g, '\n\n');
+    for (let index = normalized.length - 1; index >= 0; index -= 1) {
+        if (['.', '!', '?'].includes(normalized[index])) {
+            return normalized.slice(0, index + 1).trim();
+        }
+    }
+    return '';
 }
 
 async function runWithTimeout(operation, timeoutMs, { signal: externalSignal } = {}) {
@@ -274,15 +288,21 @@ class AiService {
                 context: 'current_turn'
             },
             text: { verbosity: 'low' },
-            max_output_tokens: 640,
             safety_identifier: safetyIdentifier,
             service_tier: this.serviceTier,
             store: false
         }, { signal }), this.deepVoiceTimeoutMs, { signal: externalSignal });
 
-        const answer = truncateText(response?.output_text, 1400);
+        const rawAnswer = String(response?.output_text || '').trim().replace(/\n{3,}/g, '\n\n');
+        const incompleteReason = response?.incomplete_details?.reason;
+        const answer = response?.status !== 'incomplete'
+            ? rawAnswer
+            : incompleteReason === 'max_output_tokens'
+                ? completeSentencePrefix(rawAnswer)
+                : '';
         if (!answer) {
-            throw Object.assign(new Error('OpenAI returned an empty answer'), { code: 'AI_EMPTY_RESPONSE' });
+            const code = response?.status === 'incomplete' ? 'AI_INCOMPLETE_RESPONSE' : 'AI_EMPTY_RESPONSE';
+            throw Object.assign(new Error('OpenAI did not return a complete answer'), { code });
         }
         return {
             answer,

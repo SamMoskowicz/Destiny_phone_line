@@ -122,7 +122,176 @@ test('session update configures PCMU, transcription, VAD, reasoning, and the dee
     assert.equal(event.session.audio.input.transcription.model, 'gpt-transcribe');
     assert.equal(event.session.audio.input.turn_detection.silence_duration_ms, 350);
     assert.deepEqual(event.session.reasoning, { effort: 'low' });
+    assert.equal(event.session.max_output_tokens, 'inf');
     assert.equal(event.session.tools[0].name, 'answer_complex_question');
+});
+
+test('an output-token cutoff automatically continues the spoken answer', () => {
+    const { bridge, upstream, twilioSocket, state } = createHarness();
+    completeSetup(upstream);
+
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'resp-limit', status: 'in_progress', metadata: {} }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'resp-limit',
+        item_id: 'item-limit',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'resp-limit',
+            status: 'incomplete',
+            status_details: { type: 'incomplete', reason: 'max_output_tokens' },
+            usage: { total_tokens: 512 },
+            output: [{
+                type: 'message',
+                content: [{ type: 'output_audio', transcript: 'An unfinished answer' }]
+            }]
+        }
+    });
+
+    const continuation = upstream.sent.at(-1);
+    assert.equal(continuation.type, 'response.create');
+    assert.match(continuation.response.instructions, /finish the interrupted sentence/i);
+    assert.equal(continuation.response.conversation, 'auto');
+    assert.deepEqual(continuation.response.output_modalities, ['audio']);
+    assert.equal(continuation.response.max_output_tokens, 'inf');
+    assert.deepEqual(continuation.response.tools, []);
+    assert.equal(continuation.response.tool_choice, 'none');
+    assert.deepEqual(continuation.response.metadata, {
+        response_purpose: 'max_token_continuation',
+        source_response_id: 'resp-limit',
+        turn_epoch: '0',
+        continuation_depth: '1'
+    });
+    assert.equal(state.continuationCount, 1);
+
+    upstream.receive({
+        type: 'response.done',
+        response: { status: 'completed', usage: { total_tokens: 20 }, output: [] }
+    });
+    assert.equal(state.continuationCount, 0);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('a newer caller turn suppresses continuation of a stale response', () => {
+    const { bridge, upstream, twilioSocket } = createHarness();
+    completeSetup(upstream);
+
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'resp-old', status: 'in_progress', metadata: {} }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'resp-old',
+        item_id: 'item-old',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    const responseCreatesBefore = upstream.sent.filter((event) => event.type === 'response.create').length;
+
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'resp-old',
+            status: 'incomplete',
+            status_details: { type: 'incomplete', reason: 'max_output_tokens' },
+            usage: { total_tokens: 512 },
+            output: [{
+                type: 'message',
+                content: [{ type: 'output_audio', transcript: 'Stale partial answer' }]
+            }]
+        }
+    });
+
+    const responseCreatesAfter = upstream.sent.filter((event) => event.type === 'response.create').length;
+    assert.equal(responseCreatesAfter, responseCreatesBefore);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('audio from an already-requested continuation is dropped after a newer caller turn', () => {
+    const { bridge, upstream, twilioSocket } = createHarness();
+    completeSetup(upstream);
+
+    upstream.receive({
+        type: 'response.created',
+        response: { id: 'resp-limited', status: 'in_progress', metadata: {} }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'resp-limited',
+        item_id: 'item-limited',
+        delta: Buffer.alloc(160, 42).toString('base64')
+    });
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'resp-limited',
+            status: 'incomplete',
+            status_details: { type: 'incomplete', reason: 'max_output_tokens' },
+            usage: { total_tokens: 512 },
+            output: [{
+                type: 'message',
+                content: [{ type: 'output_audio', transcript: 'An unfinished answer' }]
+            }]
+        }
+    });
+    const continuationRequest = upstream.sent.at(-1);
+    assert.equal(continuationRequest.type, 'response.create');
+
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    const mediaBefore = twilioSocket.sent.filter((event) => event.event === 'media').length;
+    upstream.receive({
+        type: 'response.created',
+        response: {
+            id: 'resp-continuation',
+            status: 'in_progress',
+            metadata: continuationRequest.response.metadata
+        }
+    });
+    upstream.receive({
+        type: 'response.output_audio.delta',
+        response_id: 'resp-continuation',
+        item_id: 'item-continuation',
+        delta: Buffer.alloc(160, 7).toString('base64')
+    });
+    const mediaAfter = twilioSocket.sent.filter((event) => event.event === 'media').length;
+    assert.equal(mediaAfter, mediaBefore);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('content-filtered responses are never automatically continued', () => {
+    const { bridge, upstream, twilioSocket } = createHarness();
+    completeSetup(upstream);
+    const responseCreatesBefore = upstream.sent.filter((event) => event.type === 'response.create').length;
+
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            status: 'incomplete',
+            status_details: { type: 'incomplete', reason: 'content_filter' },
+            usage: { total_tokens: 10 },
+            output: []
+        }
+    });
+
+    const responseCreatesAfter = upstream.sent.filter((event) => event.type === 'response.create').length;
+    assert.equal(responseCreatesAfter, responseCreatesBefore);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
 });
 
 test('a non-OpenAI Realtime URL disables the bridge before a secret can be sent', () => {

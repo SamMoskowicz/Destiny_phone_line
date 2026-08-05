@@ -31,7 +31,7 @@ test('long GSM answers retain the compliance footer and fit exactly within three
     assert.equal(metrics.encoding, 'GSM-7');
     assert.equal(metrics.segments, 3);
     assert.ok(metrics.units <= 459);
-    assert.match(message, /^Destiny AI: /);
+    assert.match(message, /^ChatGPT: /);
     assert.match(message, /\.\.\.\nReply STOP to unsubscribe\.$/);
     assert.ok(message.endsWith(SMS_SUFFIX));
 });
