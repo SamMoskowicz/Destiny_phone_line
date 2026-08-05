@@ -6,7 +6,6 @@ const path = require('path');
 const {
     AiService,
     OPENAI_API_BASE_URL,
-    buildMemoryTransparencyInstructions,
     truncateText
 } = require('../src/aiService');
 const { AiMemoryStore } = require('../src/aiMemoryStore');
@@ -114,16 +113,6 @@ test('persistent memory shares prior voice context with SMS and records the new 
     } finally {
         fs.rmSync(fixture.directory, { recursive: true, force: true });
     }
-});
-
-test('memory transparency follows the active retention configuration', () => {
-    const instructions = buildMemoryTransparencyInstructions({
-        persistentMemory: true,
-        retentionDays: 45
-    });
-
-    assert.match(instructions, /expires automatically after 45 days of inactivity/i);
-    assert.doesNotMatch(instructions, /no automatic time-based expiration/i);
 });
 
 test('older exchanges are summarized with store disabled on the OpenAI request', async () => {

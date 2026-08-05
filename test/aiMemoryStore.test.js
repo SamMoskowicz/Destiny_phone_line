@@ -139,93 +139,28 @@ test('a wrong encryption key fails closed without returning another user memory'
     }
 });
 
-test('caller memory has no automatic time-based expiration by default', () => {
+test('caller memory never expires based on elapsed time', () => {
     let now = Date.UTC(2026, 0, 1);
     const fixture = createStore({ clock: () => now });
     try {
-        assert.equal(fixture.store.retentionDays, 0);
-        assert.equal(fixture.store.retentionMs, null);
         assert.equal(fixture.store.appendExchange({
             safetyIdentifier: SAFETY_ID,
-            exchangeId: 'persistent-by-default',
+            exchangeId: 'persistent-without-expiration',
             channel: 'sms',
             userText: 'Remember this without a time limit.',
             assistantText: 'Okay.'
         }), true);
 
         now += 10 * 365 * 24 * 60 * 60 * 1000;
-        assert.equal(fixture.store.pruneExpiredProfiles(), true);
         assert.equal(fixture.store.getSnapshot(SAFETY_ID).exchanges.length, 1);
-    } finally {
-        fs.rmSync(fixture.directory, { recursive: true, force: true });
-    }
-});
-
-test('inactive caller memory expires and rejects replies from the expired generation', () => {
-    let now = Date.UTC(2026, 0, 1);
-    const fixture = createStore({
-        retentionDays: 365,
-        clock: () => now
-    });
-    try {
-        const generation = fixture.store.getGeneration(SAFETY_ID);
-        assert.equal(fixture.store.appendExchange({
-            safetyIdentifier: SAFETY_ID,
-            exchangeId: 'before-expiry',
-            channel: 'voice',
-            userText: 'Remember this until the retention period ends.',
-            assistantText: 'Okay.',
-            expectedGeneration: generation
-        }), true);
-
-        now += 366 * 24 * 60 * 60 * 1000;
-        assert.equal(fixture.store.getSnapshot(SAFETY_ID).exchanges.length, 0);
-        assert.equal(fixture.store.appendExchange({
-            safetyIdentifier: SAFETY_ID,
-            exchangeId: 'stale-after-expiry',
-            channel: 'voice',
-            userText: 'Stale in-flight turn.',
-            assistantText: 'Stale answer.',
-            expectedGeneration: generation
-        }), false);
-        assert.ok(fixture.store.getGeneration(SAFETY_ID) > generation);
-    } finally {
-        fs.rmSync(fixture.directory, { recursive: true, force: true });
-    }
-});
-
-test('a retention sweep removes dormant profiles even when those callers never return', () => {
-    let now = Date.UTC(2026, 0, 1);
-    const otherSafetyId = `usr_${'e'.repeat(48)}`;
-    const fixture = createStore({ retentionDays: 30, clock: () => now });
-    try {
-        for (const [safetyIdentifier, exchangeId] of [
-            [SAFETY_ID, 'dormant-one'],
-            [otherSafetyId, 'dormant-two']
-        ]) {
-            fixture.store.appendExchange({
-                safetyIdentifier,
-                exchangeId,
-                channel: 'sms',
-                userText: 'This profile should expire without being accessed.',
-                assistantText: 'Okay.'
-            });
-        }
-
-        now += 31 * 24 * 60 * 60 * 1000;
-        assert.equal(fixture.store.pruneExpiredProfiles(), true);
-        assert.equal(fixture.store.users.size, 0);
-
         const reloaded = new AiMemoryStore({
             enabled: true,
             storageFile: fixture.storageFile,
             encryptionKey: MEMORY_KEY,
-            retentionDays: 30,
             clock: () => now,
             logger: { warn() {} }
         });
-        assert.equal(reloaded.getSnapshot(SAFETY_ID).exchanges.length, 0);
-        assert.equal(reloaded.getSnapshot(otherSafetyId).exchanges.length, 0);
+        assert.equal(reloaded.getSnapshot(SAFETY_ID).exchanges.length, 1);
     } finally {
         fs.rmSync(fixture.directory, { recursive: true, force: true });
     }

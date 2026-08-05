@@ -43,8 +43,7 @@ function cloneProfile(profile) {
         revision: profile.revision,
         summary: profile.summary,
         recent: profile.recent.map((entry) => ({ ...entry })),
-        pendingSummary: profile.pendingSummary.map((entry) => ({ ...entry })),
-        updatedAt: profile.updatedAt
+        pendingSummary: profile.pendingSummary.map((entry) => ({ ...entry }))
     };
 }
 
@@ -55,7 +54,6 @@ class AiMemoryStore {
         encryptionKey = process.env.AI_MEMORY_ENCRYPTION_KEY,
         maxRecentExchanges = process.env.AI_MEMORY_RECENT_EXCHANGES || 10,
         maxPendingSummary = process.env.AI_MEMORY_MAX_PENDING_SUMMARY || 10,
-        retentionDays = process.env.AI_MEMORY_RETENTION_DAYS ?? 0,
         maxUsers = process.env.AI_MEMORY_MAX_USERS || 10000,
         maxFieldCharacters = process.env.AI_MEMORY_MAX_FIELD_CHARACTERS || 16000,
         maxContextCharacters = process.env.AI_MEMORY_MAX_CONTEXT_CHARACTERS || 32000,
@@ -68,10 +66,6 @@ class AiMemoryStore {
         this.encryptionKey = deriveEncryptionKey(encryptionKey);
         this.maxRecentExchanges = boundedInteger(maxRecentExchanges, 10, 1, 20);
         this.maxPendingSummary = boundedInteger(maxPendingSummary, 10, 1, 200);
-        this.retentionDays = boundedInteger(retentionDays, 0, 0, 3650);
-        this.retentionMs = this.retentionDays > 0
-            ? this.retentionDays * 24 * 60 * 60 * 1000
-            : null;
         this.maxUsers = boundedInteger(maxUsers, 10000, 10, 100000);
         this.maxFieldCharacters = boundedInteger(maxFieldCharacters, 16000, 1000, 50000);
         this.maxContextCharacters = boundedInteger(maxContextCharacters, 32000, 4000, 100000);
@@ -110,8 +104,7 @@ class AiMemoryStore {
             revision: 0,
             summary: '',
             recent: [],
-            pendingSummary: [],
-            updatedAt: new Date(this.clock()).toISOString()
+            pendingSummary: []
         };
     }
 
@@ -147,9 +140,6 @@ class AiMemoryStore {
             .map((entry) => this.sanitizeExchange(entry))
             .filter(Boolean)
             .slice(-this.maxPendingSummary);
-        profile.updatedAt = Number.isFinite(new Date(value?.updatedAt).getTime())
-            ? new Date(value.updatedAt).toISOString()
-            : new Date(this.clock()).toISOString();
         return profile;
     }
 
@@ -192,80 +182,12 @@ class AiMemoryStore {
                     this.tombstones.set(identifier, generation);
                 }
             }
-            this.pruneExpiredProfiles();
         } catch (error) {
             this.users.clear();
             this.tombstones.clear();
             this.loadFailed = true;
             this.warn('load_failed');
         }
-    }
-
-    isProfileExpired(profile) {
-        if (!this.retentionMs) {
-            return false;
-        }
-        const updatedAt = new Date(profile?.updatedAt).getTime();
-        return Number.isFinite(updatedAt) && this.clock() - updatedAt >= this.retentionMs;
-    }
-
-    buildExpiredState(identifiers) {
-        const nextUsers = new Map(this.users);
-        const nextTombstones = new Map(this.tombstones);
-        for (const identifier of identifiers) {
-            const profile = nextUsers.get(identifier);
-            if (!profile) {
-                continue;
-            }
-            const generation = Math.max(
-                Number(profile.generation) || 0,
-                Number(nextTombstones.get(identifier)) || 0
-            ) + 1;
-            nextUsers.delete(identifier);
-            nextTombstones.delete(identifier);
-            nextTombstones.set(identifier, generation);
-        }
-        while (nextTombstones.size > this.maxUsers) {
-            nextTombstones.delete(nextTombstones.keys().next().value);
-        }
-        return { nextUsers, nextTombstones };
-    }
-
-    pruneExpiredProfiles() {
-        if (!this.isConfigured()) {
-            return false;
-        }
-        const expired = Array.from(this.users.entries())
-            .filter(([, profile]) => this.isProfileExpired(profile))
-            .map(([identifier]) => identifier);
-        if (!expired.length) {
-            return true;
-        }
-        const { nextUsers, nextTombstones } = this.buildExpiredState(expired);
-        if (!this.persist(nextUsers, nextTombstones)) {
-            this.loadFailed = true;
-            this.warn('retention_cleanup_failed');
-            return false;
-        }
-        this.users = nextUsers;
-        this.tombstones = nextTombstones;
-        return true;
-    }
-
-    expireProfileIfNeeded(identifier) {
-        const profile = this.users.get(identifier);
-        if (!profile || !this.isProfileExpired(profile)) {
-            return true;
-        }
-        const { nextUsers, nextTombstones } = this.buildExpiredState([identifier]);
-        if (!this.persist(nextUsers, nextTombstones)) {
-            this.loadFailed = true;
-            this.warn('retention_cleanup_failed');
-            return false;
-        }
-        this.users = nextUsers;
-        this.tombstones = nextTombstones;
-        return true;
     }
 
     serialize(users, tombstones) {
@@ -322,7 +244,7 @@ class AiMemoryStore {
 
     getGeneration(safetyIdentifier) {
         const identifier = normalizeSafetyIdentifier(safetyIdentifier);
-        if (!identifier || !this.isConfigured() || !this.expireProfileIfNeeded(identifier)) {
+        if (!identifier || !this.isConfigured()) {
             return null;
         }
         return this.users.get(identifier)?.generation || this.tombstones.get(identifier) || 0;
@@ -331,9 +253,6 @@ class AiMemoryStore {
     getSnapshot(safetyIdentifier) {
         const identifier = normalizeSafetyIdentifier(safetyIdentifier);
         if (!identifier || !this.isConfigured()) {
-            return { generation: 0, summary: '', exchanges: [], context: '' };
-        }
-        if (!this.expireProfileIfNeeded(identifier)) {
             return { generation: 0, summary: '', exchanges: [], context: '' };
         }
         const profile = this.users.get(identifier);
@@ -419,7 +338,6 @@ class AiMemoryStore {
             this.warn('summary_backlog_clipped');
         }
         profile.revision += 1;
-        profile.updatedAt = new Date(this.clock()).toISOString();
 
         const nextUsers = new Map(this.users);
         nextUsers.delete(identifier);
@@ -439,7 +357,7 @@ class AiMemoryStore {
 
     getSummaryWork(safetyIdentifier, maximumExchanges = 10) {
         const identifier = normalizeSafetyIdentifier(safetyIdentifier);
-        if (!identifier || !this.isConfigured() || !this.expireProfileIfNeeded(identifier)) {
+        if (!identifier || !this.isConfigured()) {
             return null;
         }
         const profile = identifier ? this.users.get(identifier) : null;
@@ -457,7 +375,7 @@ class AiMemoryStore {
 
     commitSummary({ safetyIdentifier, generation, exchangeIds, summary } = {}) {
         const identifier = normalizeSafetyIdentifier(safetyIdentifier);
-        if (!identifier || !this.isConfigured() || !this.expireProfileIfNeeded(identifier)) {
+        if (!identifier || !this.isConfigured()) {
             return false;
         }
         const existing = identifier ? this.users.get(identifier) : null;
@@ -473,7 +391,6 @@ class AiMemoryStore {
         profile.pendingSummary = profile.pendingSummary.filter((entry) => !ids.has(entry.id));
         profile.summary = cleanSummary;
         profile.revision += 1;
-        profile.updatedAt = new Date(this.clock()).toISOString();
         const nextUsers = new Map(this.users);
         nextUsers.delete(identifier);
         nextUsers.set(identifier, profile);

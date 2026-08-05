@@ -56,7 +56,7 @@ test('failed preference persistence rolls back an in-memory opt-out', () => {
     assert.equal(store.isOptedOut(identifier), false);
 });
 
-test('STOP remains active without time-based expiration', () => {
+test('STOP remains active indefinitely', () => {
     let now = Date.UTC(2026, 0, 1);
     const identifier = `usr_${'f'.repeat(48)}`;
     const store = new ConsentStore({

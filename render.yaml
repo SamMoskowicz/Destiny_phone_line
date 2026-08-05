@@ -35,7 +35,5 @@ services:
         value: "10"
       - key: AI_MEMORY_MAX_PENDING_SUMMARY
         value: "10"
-      - key: AI_MEMORY_RETENTION_DAYS
-        value: "0"
       - key: AI_CONSENT_FILE
         value: /var/data/ai-consent.json

@@ -268,8 +268,7 @@ class RealtimeVoiceBridge {
     buildInstructions() {
         const memoryStore = this.aiService?.memoryStore;
         return `${BASE_INSTRUCTIONS}\n${buildMemoryTransparencyInstructions({
-            persistentMemory: Boolean(memoryStore?.isConfigured?.()),
-            retentionDays: memoryStore?.retentionDays
+            persistentMemory: Boolean(memoryStore?.isConfigured?.())
         })}`;
     }
 

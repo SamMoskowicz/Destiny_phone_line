@@ -1599,14 +1599,6 @@ function startServer() {
         }, 30000);
         archiveSweepTimer.unref?.();
 
-        if (aiMemoryStore.retentionMs) {
-            const memoryRetentionSweepTimer = setInterval(() => {
-                if (aiMemoryStore.isConfigured()) {
-                    aiMemoryStore.pruneExpiredProfiles();
-                }
-            }, 60 * 60 * 1000);
-            memoryRetentionSweepTimer.unref?.();
-        }
     });
     return server;
 }

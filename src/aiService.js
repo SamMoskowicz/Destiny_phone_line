@@ -2,7 +2,7 @@ const OpenAI = require('openai');
 
 const OPENAI_API_BASE_URL = 'https://api.openai.com/v1';
 
-function buildMemoryTransparencyInstructions({ persistentMemory = false, retentionDays = 0 } = {}) {
+function buildMemoryTransparencyInstructions({ persistentMemory = false } = {}) {
     const opening = `Do not volunteer or routinely mention memory or storage. If the user asks
 whether this service remembers or saves conversations, answer truthfully.`;
     if (!persistentMemory) {
@@ -10,13 +10,9 @@ whether this service remembers or saves conversations, answer truthfully.`;
 keep a bounded, short-lived SMS context in process for follow-up messages, but it does not add SMS
 or call transcripts to an encrypted cross-channel caller profile. Raw call audio is not stored.`;
     }
-    const parsedRetentionDays = Number(retentionDays);
-    const retention = Number.isFinite(parsedRetentionDays) && parsedRetentionDays > 0
-        ? `The caller profile expires automatically after ${Math.floor(parsedRetentionDays)} days of inactivity.`
-        : 'There is no automatic time-based expiration.';
     return `${opening} This application automatically stores a bounded recent window of SMS
 messages and AI-call transcripts verbatim, plus compact key points, linked to the caller's phone
-number. Raw call audio is not stored. ${retention} The user can text DELETE or FORGET to erase
+number. Raw call audio is not stored. There is no automatic time-based expiration. The user can text DELETE or FORGET to erase
 saved AI memory, text STOP to erase it and unsubscribe, or call back and press 9 at the main menu.
 Do not promise permanent storage because capacity limits, an operator action, or infrastructure
 loss can remove it.`;
@@ -370,8 +366,7 @@ class AiService {
         }
         const persistentMemory = Boolean(this.memoryStore?.isConfigured?.());
         const transparencyInstructions = buildMemoryTransparencyInstructions({
-            persistentMemory,
-            retentionDays: this.memoryStore?.retentionDays
+            persistentMemory
         });
         const memorySnapshot = this.getMemorySnapshot(safetyIdentifier);
         const session = persistentMemory ? null : this.getTextSession(safetyIdentifier);
@@ -467,8 +462,7 @@ class AiService {
 
         const memoryContext = this.getMemoryContext(safetyIdentifier);
         const transparencyInstructions = buildMemoryTransparencyInstructions({
-            persistentMemory: Boolean(this.memoryStore?.isConfigured?.()),
-            retentionDays: this.memoryStore?.retentionDays
+            persistentMemory: Boolean(this.memoryStore?.isConfigured?.())
         });
         const currentInput = cleanContext
             ? `Recent conversation context:\n${cleanContext}\n\nQuestion to answer:\n${cleanQuestion}`

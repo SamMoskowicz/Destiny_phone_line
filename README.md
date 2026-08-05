@@ -84,7 +84,7 @@ Memory is application-managed and shared across SMS and AI voice for the same pr
 
 By default, the newest 10 active exchanges are stored verbatim. When an older exchange rolls out of that active window, it moves into a bounded encrypted overflow of up to 10 exchanges while awaiting summarization. A `store: false` OpenAI request then folds important, explicitly stated key points into a compact summary and removes the summarized overflow. If summarization remains unavailable after that overflow fills, the oldest pending exchange is dropped to keep storage bounded. The summary deliberately excludes credentials and avoids inferred sensitive traits. Voice "verbatim" means the exact transcription returned by OpenAI, which can contain speech-recognition errors; raw call audio is never saved.
 
-Caller profiles do not expire automatically by default. They remain until the caller uses `DELETE`, `FORGET`, `STOP`, or voice-menu key 9; an operator removes the data; infrastructure is lost; or a configured storage bound is reached. Set `AI_MEMORY_RETENTION_DAYS` to a positive number only if time-based expiration is deliberately wanted.
+Caller profiles have no automatic time-based expiration. They remain until the caller uses `DELETE`, `FORGET`, `STOP`, or voice-menu key 9; an operator removes the data; infrastructure is lost; or a configured storage bound is reached.
 
 The memory file is encrypted with AES-256-GCM using `AI_MEMORY_ENCRYPTION_KEY` and contains the HMAC-based caller identifier rather than the raw phone number. Rotating either that encryption key or `AI_SAFETY_SALT` makes existing memory unreadable or unreachable. Keep both secrets stable and backed up securely.
 
@@ -134,7 +134,6 @@ curl -X POST "${RENDER_URL}/admin/stream/recording" \
 - AI_MEMORY_ENCRYPTION_KEY: separate random secret of at least 32 characters; required when memory is enabled and generated automatically for a new Blueprint service
 - AI_MEMORY_RECENT_EXCHANGES: number of newest verbatim exchanges retained per caller; defaults to 10 and is clamped to 1-20
 - AI_MEMORY_MAX_PENDING_SUMMARY: maximum encrypted verbatim overflow retained while older exchanges await key-point summarization; defaults to 10
-- AI_MEMORY_RETENTION_DAYS: optional inactivity expiration for a caller's profile; defaults to `0`, which disables automatic time-based deletion
 - AI_MEMORY_MAX_USERS: maximum caller profiles; defaults to 10000
 - AI_MEMORY_MAX_FIELD_CHARACTERS / AI_MEMORY_MAX_CONTEXT_CHARACTERS: abuse and model-context bounds; default to 16000 / 32000
 - AI_CONSENT_FILE: local STOP/START opt-out-state file; defaults to `data/ai-consent.json`, and the Render Blueprint uses `/var/data/ai-consent.json` (the legacy variable name is retained for deployment compatibility)

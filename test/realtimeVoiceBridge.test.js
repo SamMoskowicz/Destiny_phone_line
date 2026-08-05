@@ -68,7 +68,6 @@ function createHarness({
     memoryContext = '',
     memoryGeneration = 0,
     persistentMemory = true,
-    retentionDays = 0,
     bridgeOptions = {}
 } = {}) {
     const tokenStore = new EphemeralSessionTokenStore();
@@ -79,8 +78,7 @@ function createHarness({
         calls: [],
         memoryRecords: [],
         memoryStore: persistentMemory ? {
-            isConfigured: () => true,
-            retentionDays
+            isConfigured: () => true
         } : null,
         isConfigured: () => true,
         getMemorySnapshot: () => ({
@@ -221,20 +219,13 @@ test('voice startup receives the same persistent caller memory as SMS', () => {
     bridge.close();
 });
 
-test('Realtime memory disclosure follows disabled and expiring configurations', () => {
+test('Realtime memory disclosure follows whether persistent memory is enabled', () => {
     const disabled = createHarness({ persistentMemory: false });
     disabled.upstream.open();
     assert.match(disabled.upstream.sent[0].session.instructions, /persistent caller memory is currently disabled/i);
     assert.doesNotMatch(disabled.upstream.sent[0].session.instructions, /automatically stores a bounded recent window/i);
     disabled.twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     disabled.bridge.close();
-
-    const expiring = createHarness({ retentionDays: 45 });
-    expiring.upstream.open();
-    assert.match(expiring.upstream.sent[0].session.instructions, /expires automatically after 45 days of inactivity/i);
-    assert.doesNotMatch(expiring.upstream.sent[0].session.instructions, /no automatic time-based expiration/i);
-    expiring.twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
-    expiring.bridge.close();
 });
 
 test('a completed initial greeting is never attached to the first caller memory exchange', () => {
