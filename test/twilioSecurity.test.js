@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const twilio = require('twilio');
 const { TwilioSecurity, buildPublicRequestUrl } = require('../src/twilioSecurity');
 
-test('HTTP Twilio signatures use the configured public URL and expected account/number', () => {
+test('HTTP Twilio signatures accept multiple numbers from the configured account', () => {
     const authToken = 'test-auth-token';
     const url = 'https://phone.example/voice/menu';
     const params = {
@@ -12,23 +12,30 @@ test('HTTP Twilio signatures use the configured public URL and expected account/
         From: '+15550002222',
         Digits: '8'
     };
-    const signature = twilio.getExpectedTwilioSignature(authToken, url, params);
     const security = new TwilioSecurity({
         authToken,
         accountSid: 'AC123',
-        phoneNumber: '+15550001111',
         publicBaseUrl: 'https://phone.example'
     });
-    const req = {
+    const signedRequest = (signedParams) => ({
         url: '/voice/menu',
         headers: {
             host: 'attacker.example',
-            'x-twilio-signature': signature
+            'x-twilio-signature': twilio.getExpectedTwilioSignature(authToken, url, signedParams)
         }
-    };
+    });
 
-    assert.equal(security.validateHttpRequest(req, params), true);
-    assert.equal(security.validateHttpRequest(req, { ...params, AccountSid: 'AC999' }), false);
+    assert.equal(security.validateHttpRequest(signedRequest(params), params), true);
+    const secondNumberParams = { ...params, To: '+18885550123' };
+    assert.equal(
+        security.validateHttpRequest(signedRequest(secondNumberParams), secondNumberParams),
+        true
+    );
+    const wrongAccountParams = { ...params, AccountSid: 'AC999' };
+    assert.equal(
+        security.validateHttpRequest(signedRequest(wrongAccountParams), wrongAccountParams),
+        false
+    );
 });
 
 test('WebSocket Twilio signatures validate the exact WSS stream URL', () => {

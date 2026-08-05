@@ -53,14 +53,12 @@ class TwilioSecurity {
     constructor({
         authToken = process.env.TWILIO_AUTH_TOKEN,
         accountSid = process.env.TWILIO_ACCOUNT_SID,
-        phoneNumber = process.env.TWILIO_PHONE_NUMBER,
         publicBaseUrl = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL,
         allowDevelopmentHostFallback = process.env.NODE_ENV !== 'production'
     } = {}) {
         this.allowDevelopmentHostFallback = Boolean(allowDevelopmentHostFallback);
         this.authToken = authToken || null;
         this.accountSid = accountSid || null;
-        this.phoneNumber = phoneNumber || null;
         this.publicBaseUrl = normalizeBaseUrl(publicBaseUrl, {
             requireHttps: !this.allowDevelopmentHostFallback
         });
@@ -74,18 +72,15 @@ class TwilioSecurity {
         return Boolean(this.publicBaseUrl);
     }
 
-    validateExpectedTarget(params) {
+    validateExpectedAccount(params) {
         if (this.accountSid && params.AccountSid !== this.accountSid) {
-            return false;
-        }
-        if (this.phoneNumber && params.To !== this.phoneNumber) {
             return false;
         }
         return true;
     }
 
     validateHttpRequest(req, params) {
-        if (!this.authToken || !this.validateExpectedTarget(params)) {
+        if (!this.authToken || !this.validateExpectedAccount(params)) {
             return false;
         }
         if (!this.publicBaseUrl && !this.allowDevelopmentHostFallback) {

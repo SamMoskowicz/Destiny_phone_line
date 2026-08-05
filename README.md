@@ -52,7 +52,7 @@ If you use Twilio:
 1. Buy or configure a phone number.
 2. In the Twilio Voice configuration, set the webhook URL for incoming calls to `${RENDER_URL}/voice`.
 3. In Messaging configuration, set **A message comes in** to `${RENDER_URL}/sms` using HTTP POST. A Twilio Messaging Service with Advanced Opt-Out is recommended.
-4. Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_PHONE_NUMBER` to the values for that number. Incoming voice, SMS, and AI Media Stream requests are signature-checked when these are configured; SMS and AI voice are disabled without the auth token.
+4. Set `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` for the account that owns your numbers. Any number in that account can use the webhooks; incoming voice, SMS, and AI Media Stream requests remain signature-checked. SMS and AI voice are disabled without the auth token.
 5. Set `OPENAI_API_KEY`, `AI_SAFETY_SALT`, and a fixed HTTPS `PUBLIC_BASE_URL`. The API key stays on the server and is never placed in TwiML or sent to the caller.
 6. Live and archived playback are both served internally (`/live.mp3`, `/recordings/:id/play`) - you don't need a separate relay or tunnel.
 7. For manual overrides, send requests to `/admin/stream/live`, `/admin/stream/stop`, and `/admin/stream/recording` with an `Authorization: Bearer <ADMIN_TOKEN>` header.
@@ -107,7 +107,6 @@ curl -X POST "${RENDER_URL}/admin/stream/recording" \
 - OPENAI_API_KEY: server-side OpenAI API key; required for both AI modes
 - TWILIO_ACCOUNT_SID: expected Twilio account for signed webhooks
 - TWILIO_AUTH_TOKEN: validates Twilio HTTP and WebSocket signatures; required for SMS and AI voice
-- TWILIO_PHONE_NUMBER: expected destination number, in E.164 format
 - AI_SAFETY_SALT: required long random secret used to create stable, privacy-preserving OpenAI safety identifiers; AI is disabled without it and rotating it also changes locally stored consent identifiers
 - AI_CONSENT_FILE: local STOP/START consent file; defaults to `data/ai-consent.json` and should live on durable storage
 - OPENAI_REALTIME_MODEL: defaults to `gpt-realtime-2.1` (the full model, not mini)
