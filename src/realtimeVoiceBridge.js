@@ -30,9 +30,8 @@ const CONTINUATION_INSTRUCTIONS = `${DEFAULT_INSTRUCTIONS}
 ${CONTINUATION_SUFFIX}`;
 
 const INITIAL_GREETING_PURPOSE = 'initial_greeting';
-const INITIAL_GREETING_INSTRUCTIONS = `Say exactly this short, natural greeting: "Hi! You're
-speaking with ChatGPT. What would you like to talk about?" Do not add anything else and do not call
-a tool.`;
+const INITIAL_GREETING_INSTRUCTIONS = `Say exactly this short, natural greeting: "Hi! How can I
+help?" Do not add anything else and do not call a tool.`;
 
 function asInteger(value, fallback, minimum, maximum) {
     const number = Number(value);
@@ -720,7 +719,7 @@ class RealtimeVoiceBridge {
                     conversation: 'auto',
                     output_modalities: ['audio'],
                     instructions: INITIAL_GREETING_INSTRUCTIONS,
-                    max_output_tokens: 80,
+                    max_output_tokens: 'inf',
                     tools: [],
                     tool_choice: 'none',
                     metadata: {

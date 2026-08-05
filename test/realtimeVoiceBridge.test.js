@@ -162,8 +162,9 @@ test('accepted Realtime setup requests one short proactive audio greeting', () =
     assert.equal(greeting.response.conversation, 'auto');
     assert.equal(greeting.response.tool_choice, 'none');
     assert.deepEqual(greeting.response.tools, []);
-    assert.match(greeting.response.instructions, /speaking with ChatGPT/i);
-    assert.match(greeting.response.instructions, /what\s+would you like to talk about/i);
+    assert.equal(greeting.response.max_output_tokens, 'inf');
+    assert.match(greeting.response.instructions, /Hi! How can I\s+help\?/i);
+    assert.doesNotMatch(greeting.response.instructions, /speaking with ChatGPT/i);
     assert.doesNotMatch(greeting.response.instructions, /memory|save|storage|transcript|call audio/i);
     assert.deepEqual(greeting.response.metadata, {
         response_purpose: 'initial_greeting',
