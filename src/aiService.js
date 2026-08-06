@@ -67,6 +67,8 @@ const REQUIRED_WEB_SEARCH_PATTERNS = Object.freeze([
     /\bcite\s+(?:your\s+)?sources?\b/i,
     /\b(?:today|tonight|tomorrow|yesterday|last\s+night|right\s+now|currently|current|latest|newest|recent|breaking|live|up[ -]to[ -]date|as\s+of|this\s+(?:week|month|year)|next\s+(?:week|month|year))\b/i,
     /\b(?:news|weather|forecast|scores?|standings|schedule|traffic|polls?|election\s+results?|stock\s+price|share\s+price|price\s+of|exchange\s+rate|interest\s+rate|flight\s+status|in\s+stock)\b/i,
+    /\b(?:stocks?|shares?|markets?|indexes|indices|crypto|cryptocurrenc(?:y|ies))\b.{0,100}\b(?:doing|performing|trading|up|down|gaining|losing|price|value|worth)\b/i,
+    /\b(?:doing|performing|trading|up|down|gaining|losing|price|value|worth)\b.{0,100}\b(?:stocks?|shares?|markets?|indexes|indices|crypto|cryptocurrenc(?:y|ies))\b/i,
     /\bwho\s+is\s+(?:the\s+)?(?:president|prime\s+minister|governor|mayor|ceo|chief\s+executive|speaker)\b/i
 ]);
 
@@ -643,7 +645,35 @@ class AiService {
         return answer;
     }
 
-    async answerComplexVoice({ safetyIdentifier, question, recentTranscript = '', signal: externalSignal }) {
+    async createDeepVoiceResponse(params, { signal, onWebSearchStart } = {}) {
+        const canStreamSearchProgress = typeof onWebSearchStart === 'function'
+            && typeof this.client?.responses?.stream === 'function';
+        if (!canStreamSearchProgress) {
+            return this.client.responses.create(params, { signal });
+        }
+        const stream = this.client.responses.stream(params, { signal });
+        let searchStarted = false;
+        stream.on('event', (event) => {
+            if (searchStarted || event?.type !== 'response.web_search_call.in_progress') {
+                return;
+            }
+            searchStarted = true;
+            try {
+                onWebSearchStart();
+            } catch (error) {
+                // A nonessential status cue must never interrupt the model response.
+            }
+        });
+        return stream.finalResponse();
+    }
+
+    async answerComplexVoice({
+        safetyIdentifier,
+        question,
+        recentTranscript = '',
+        signal: externalSignal,
+        onWebSearchStart
+    }) {
         if (!this.client) {
             throw Object.assign(new Error('OpenAI is not configured'), { code: 'AI_NOT_CONFIGURED' });
         }
@@ -668,7 +698,7 @@ class AiService {
             ]
             : currentInput;
         const searchRequired = this.webSearchEnabled && requiresWebSearch(cleanQuestion);
-        const response = await runWithTimeout((signal) => this.client.responses.create({
+        const response = await runWithTimeout((signal) => this.createDeepVoiceResponse({
             model: this.deepVoiceModel,
             instructions: addMemoryRules(
                 `${DEEP_VOICE_INSTRUCTIONS}\n${this.webSearchInstructions({ spoken: true })}\n${transparencyInstructions}`,
@@ -684,7 +714,7 @@ class AiService {
             safety_identifier: safetyIdentifier,
             service_tier: this.serviceTier,
             store: false
-        }, { signal }), this.deepVoiceTimeoutMs, { signal: externalSignal });
+        }, { signal, onWebSearchStart }), this.deepVoiceTimeoutMs, { signal: externalSignal });
 
         assertUsableResponse(response, { searchRequired, allowIncomplete: true });
         const rawAnswer = spokenOutputText(response);

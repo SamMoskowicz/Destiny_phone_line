@@ -46,6 +46,58 @@ function asInteger(value, fallback, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, Math.floor(number)));
 }
 
+const SEARCH_CUE_SAMPLE_RATE = 8000;
+const SEARCH_CUE_FRAME_BYTES = 160;
+const SEARCH_CUE_FRAME_MS = 20;
+
+function pcm16ToMulaw(value) {
+    let pcm = Math.max(-32635, Math.min(32635, Math.round(Number(value) || 0)));
+    const sign = pcm < 0 ? 0x80 : 0;
+    if (pcm < 0) {
+        pcm = -pcm;
+    }
+    pcm += 0x84;
+    let exponent = 7;
+    for (let mask = 0x4000; exponent > 0 && (pcm & mask) === 0; mask >>= 1) {
+        exponent -= 1;
+    }
+    const mantissa = (pcm >> (exponent + 3)) & 0x0f;
+    return (~(sign | (exponent << 4) | mantissa)) & 0xff;
+}
+
+function buildSearchPulsePcmu() {
+    const totalSamples = Math.round(SEARCH_CUE_SAMPLE_RATE * 0.52);
+    const audio = Buffer.alloc(totalSamples, 0xff);
+    const notes = [
+        { startMs: 0, durationMs: 160, frequency: 523.25 },
+        { startMs: 210, durationMs: 220, frequency: 659.25 }
+    ];
+    for (let sampleIndex = 0; sampleIndex < totalSamples; sampleIndex += 1) {
+        let normalizedSample = 0;
+        for (const note of notes) {
+            const startSample = Math.round(note.startMs * SEARCH_CUE_SAMPLE_RATE / 1000);
+            const noteSamples = Math.round(note.durationMs * SEARCH_CUE_SAMPLE_RATE / 1000);
+            const localSample = sampleIndex - startSample;
+            if (localSample < 0 || localSample >= noteSamples) {
+                continue;
+            }
+            const progress = noteSamples > 1 ? localSample / (noteSamples - 1) : 1;
+            const envelope = Math.sin(Math.PI * progress) ** 2;
+            normalizedSample += Math.sin(
+                2 * Math.PI * note.frequency * localSample / SEARCH_CUE_SAMPLE_RATE
+            ) * envelope * 0.055;
+        }
+        audio[sampleIndex] = pcm16ToMulaw(normalizedSample * 32767);
+    }
+    return audio;
+}
+
+const DEFAULT_SEARCH_PULSE_PCMU = buildSearchPulsePcmu();
+const DEFAULT_CUE_TIMER_API = Object.freeze({
+    setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimeout: (timer) => clearTimeout(timer)
+});
+
 function realtimeReasoningEffort(value) {
     return ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value) ? value : 'low';
 }
@@ -225,6 +277,11 @@ class RealtimeVoiceBridge {
         maxIdlePrompts = process.env.AI_VOICE_MAX_IDLE_PROMPTS || 2,
         maxBufferedBytes = process.env.AI_VOICE_MAX_BUFFERED_BYTES || 1024 * 1024,
         maxPendingAudioBytes = process.env.AI_VOICE_MAX_PENDING_AUDIO_BYTES || 32768,
+        searchCueEnabled = process.env.AI_VOICE_SEARCH_CUE_ENABLED !== 'false',
+        searchCueDelayMs = process.env.AI_VOICE_SEARCH_CUE_DELAY_MS || 650,
+        searchCueGapMs = process.env.AI_VOICE_SEARCH_CUE_GAP_MS || 1500,
+        searchCuePcmu = DEFAULT_SEARCH_PULSE_PCMU,
+        cueTimerApi = DEFAULT_CUE_TIMER_API,
         openAiSocketFactory = (url, options) => new WebSocket(url, options),
         logger = console,
         clock = () => Date.now()
@@ -248,6 +305,20 @@ class RealtimeVoiceBridge {
         this.maxIdlePrompts = asInteger(maxIdlePrompts, 2, 0, 10);
         this.maxBufferedBytes = asInteger(maxBufferedBytes, 1024 * 1024, 65536, 16 * 1024 * 1024);
         this.maxPendingAudioBytes = asInteger(maxPendingAudioBytes, 32768, 4096, 1024 * 1024);
+        this.searchCueEnabled = searchCueEnabled !== false && searchCueEnabled !== 'false';
+        this.searchCueDelayMs = asInteger(searchCueDelayMs, 650, 0, 5000);
+        this.searchCueGapMs = asInteger(searchCueGapMs, 1500, 300, 10000);
+        this.searchCuePcmu = Buffer.isBuffer(searchCuePcmu)
+            && searchCuePcmu.length >= SEARCH_CUE_FRAME_BYTES
+            && searchCuePcmu.length <= 64 * 1024
+            && searchCuePcmu.length % SEARCH_CUE_FRAME_BYTES === 0
+            ? Buffer.from(searchCuePcmu)
+            : Buffer.from(DEFAULT_SEARCH_PULSE_PCMU);
+        this.cueTimerApi = cueTimerApi
+            && typeof cueTimerApi.setTimeout === 'function'
+            && typeof cueTimerApi.clearTimeout === 'function'
+            ? cueTimerApi
+            : DEFAULT_CUE_TIMER_API;
         this.openAiSocketFactory = openAiSocketFactory;
         this.logger = logger;
         this.clock = clock;
@@ -361,6 +432,13 @@ class RealtimeVoiceBridge {
             deepToolInFlight: false,
             deepToolAbortController: null,
             pendingTurnDuringTool: false,
+            searchCueTimer: null,
+            searchCueActive: false,
+            searchCueGeneration: 0,
+            searchCueOffset: 0,
+            searchCueHadAudio: false,
+            searchCueMarkSequence: 0,
+            pendingSearchCueMarks: new Set(),
             totalTokens: 0,
             continuationCount: 0,
             idlePromptCount: 0,
@@ -640,8 +718,9 @@ class RealtimeVoiceBridge {
             state.turnEpoch += 1;
             state.continuationCount = 0;
             state.idlePromptCount = 0;
+            const searchCueHadAudio = this.stopSearchCue(state);
             state.deepToolAbortController?.abort('caller started a newer turn');
-            this.handleBargeIn(state);
+            this.handleBargeIn(state, { forceClear: searchCueHadAudio });
         } else if (event.type === 'input_audio_buffer.speech_stopped') {
             state.turnCount += 1;
             if (state.deepToolInFlight) {
@@ -985,6 +1064,9 @@ class RealtimeVoiceBridge {
 
     acknowledgeMark(state, name) {
         const normalizedName = String(name || '');
+        if (state.pendingSearchCueMarks.delete(normalizedName)) {
+            return;
+        }
         const mark = state.pendingMarks.get(normalizedName);
         if (!mark) {
             return;
@@ -1012,8 +1094,104 @@ class RealtimeVoiceBridge {
         }
     }
 
-    handleBargeIn(state) {
-        if (!state.currentItemId || state.audioStartedAt === null) {
+    startSearchCue(state) {
+        if (!this.searchCueEnabled || state.finished || !state.deepToolInFlight || !state.streamSid) {
+            return false;
+        }
+        this.stopSearchCue(state);
+        state.searchCueActive = true;
+        const generation = state.searchCueGeneration;
+        this.scheduleSearchCue(state, generation, this.searchCueDelayMs);
+        return true;
+    }
+
+    hasBufferedSearchCue(state) {
+        return Boolean(state.searchCueHadAudio || state.pendingSearchCueMarks.size > 0);
+    }
+
+    markBufferedSearchCue(state) {
+        if (!state.searchCueHadAudio || state.twilioSocket?.readyState !== OPEN) {
+            return false;
+        }
+        state.searchCueMarkSequence += 1;
+        const name = `search-cue-${state.searchCueMarkSequence}`;
+        if (!sendJson(state.twilioSocket, {
+            event: 'mark',
+            streamSid: state.streamSid,
+            mark: { name }
+        }, this.maxBufferedBytes)) {
+            return false;
+        }
+        state.pendingSearchCueMarks.add(name);
+        state.searchCueHadAudio = false;
+        return true;
+    }
+
+    scheduleSearchCue(state, generation, delayMs) {
+        const timer = this.cueTimerApi.setTimeout(() => {
+            if (state.searchCueTimer === timer) {
+                state.searchCueTimer = null;
+            }
+            this.pumpSearchCue(state, generation);
+        }, delayMs);
+        state.searchCueTimer = timer;
+        timer?.unref?.();
+    }
+
+    pumpSearchCue(state, generation) {
+        if (state.searchCueGeneration !== generation
+            || !state.searchCueActive
+            || !state.deepToolInFlight
+            || state.finished
+            || state.twilioSocket?.readyState !== OPEN) {
+            this.stopSearchCue(state);
+            return;
+        }
+        const end = state.searchCueOffset + SEARCH_CUE_FRAME_BYTES;
+        const frame = this.searchCuePcmu.subarray(state.searchCueOffset, end);
+        if (!sendJson(state.twilioSocket, {
+            event: 'media',
+            streamSid: state.streamSid,
+            media: { payload: frame.toString('base64') }
+        }, this.maxBufferedBytes)) {
+            this.stopSearchCue(state);
+            return;
+        }
+        state.searchCueHadAudio = true;
+        state.searchCueOffset = end;
+        const loopComplete = state.searchCueOffset >= this.searchCuePcmu.length;
+        if (loopComplete) {
+            state.searchCueOffset = 0;
+        }
+        this.scheduleSearchCue(
+            state,
+            generation,
+            loopComplete ? this.searchCueGapMs : SEARCH_CUE_FRAME_MS
+        );
+    }
+
+    stopSearchCue(state, { trackBuffered = true } = {}) {
+        state.searchCueActive = false;
+        state.searchCueGeneration += 1;
+        if (state.searchCueTimer !== null) {
+            this.cueTimerApi.clearTimeout(state.searchCueTimer);
+        }
+        state.searchCueTimer = null;
+        state.searchCueOffset = 0;
+        if (trackBuffered) {
+            this.markBufferedSearchCue(state);
+        }
+        const hadAudio = this.hasBufferedSearchCue(state);
+        if (!trackBuffered) {
+            state.searchCueHadAudio = false;
+            state.pendingSearchCueMarks.clear();
+        }
+        return hadAudio;
+    }
+
+    handleBargeIn(state, { forceClear = false } = {}) {
+        const hasAssistantAudio = Boolean(state.currentItemId && state.audioStartedAt !== null);
+        if (!hasAssistantAudio && !forceClear) {
             return;
         }
         if (!sendJson(state.twilioSocket, {
@@ -1021,6 +1199,17 @@ class RealtimeVoiceBridge {
             streamSid: state.streamSid
         }, this.maxBufferedBytes)) {
             this.finish(state, { code: 1011, reason: 'call backpressure', closeTwilio: true, closeOpenAi: true });
+            return;
+        }
+
+        // Twilio returns queued marks after a clear. Forget them first so those
+        // acknowledgements cannot make interrupted audio eligible for memory.
+        state.pendingMarks.clear();
+        if (forceClear) {
+            state.searchCueHadAudio = false;
+            state.pendingSearchCueMarks.clear();
+        }
+        if (!hasAssistantAudio) {
             return;
         }
 
@@ -1049,9 +1238,6 @@ class RealtimeVoiceBridge {
         while (state.interruptedItemIds.size > 20) {
             state.interruptedItemIds.delete(state.interruptedItemIds.values().next().value);
         }
-        // Twilio returns queued marks after a clear. Forget them first so those
-        // acknowledgements cannot make interrupted audio eligible for memory.
-        state.pendingMarks.clear();
         this.beginAssistantItem(state, null);
     }
 
@@ -1206,7 +1392,15 @@ class RealtimeVoiceBridge {
                     safetyIdentifier: state.safetyIdentifier,
                     question,
                     recentTranscript: state.transcripts.join('\n'),
-                    signal: controller.signal
+                    signal: controller.signal,
+                    onWebSearchStart: this.searchCueEnabled
+                        && this.aiService?.webSearchEnabled !== false
+                        ? () => {
+                            if (!controller.signal.aborted && state.turnEpoch === turnEpoch) {
+                                this.startSearchCue(state);
+                            }
+                        }
+                        : undefined
                 });
                 if (result && typeof result === 'object') {
                     answer = String(result.answer || '');
@@ -1223,6 +1417,7 @@ class RealtimeVoiceBridge {
                     ? 'I could not finish the deeper analysis within the time limit. Try asking for a shorter answer or split the question into parts.'
                     : 'I could not complete the deeper analysis just now. Please try that question again.';
             } finally {
+                this.stopSearchCue(state);
                 if (state.deepToolAbortController === controller) {
                     state.deepToolAbortController = null;
                 }
@@ -1288,6 +1483,7 @@ class RealtimeVoiceBridge {
         }
         state.finished = true;
         state.phase = 'finished';
+        this.stopSearchCue(state, { trackBuffered: false });
         this.persistVoiceMemory(state);
         this.pendingStates.delete(state);
         clearTimeout(state.startTimer);
@@ -1314,6 +1510,7 @@ class RealtimeVoiceBridge {
         state.playedAssistantItemIds.clear();
         state.responseStates.clear();
         state.pendingMarks.clear();
+        state.pendingSearchCueMarks.clear();
         state.currentItemId = null;
         if (closeOpenAi) {
             closeSocket(state.openAiSocket, code, reason);
@@ -1368,9 +1565,11 @@ module.exports = {
     RealtimeVoiceBridge,
     DEFAULT_INSTRUCTIONS,
     CONTINUATION_INSTRUCTIONS,
+    buildSearchPulsePcmu,
     buildSessionUpdate,
     isValidBase64,
     normalizeOpenAiRealtimeUrl,
     OPENAI_REALTIME_URL,
+    pcm16ToMulaw,
     sendJson
 };

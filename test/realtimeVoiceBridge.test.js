@@ -4,8 +4,10 @@ const { EventEmitter } = require('node:events');
 const { EphemeralSessionTokenStore } = require('../src/aiSecurity');
 const {
     RealtimeVoiceBridge,
+    buildSearchPulsePcmu,
     buildSessionUpdate,
-    isValidBase64
+    isValidBase64,
+    pcm16ToMulaw
 } = require('../src/realtimeVoiceBridge');
 
 class FakeWebSocket extends EventEmitter {
@@ -42,6 +44,41 @@ class FakeWebSocket extends EventEmitter {
     terminate() {
         this.readyState = 3;
     }
+}
+
+function createFakeCueTimerApi() {
+    let nextId = 1;
+    const tasks = new Map();
+    const api = {
+        setTimeout(callback, delayMs) {
+            const timer = { id: nextId, unref() {} };
+            nextId += 1;
+            tasks.set(timer, { callback, delayMs });
+            return timer;
+        },
+        clearTimeout(timer) {
+            tasks.delete(timer);
+        }
+    };
+    return {
+        api,
+        get size() {
+            return tasks.size;
+        },
+        nextDelay() {
+            return tasks.values().next().value?.delayMs;
+        },
+        runNext() {
+            const next = tasks.entries().next();
+            if (next.done) {
+                return null;
+            }
+            const [timer, task] = next.value;
+            tasks.delete(timer);
+            task.callback();
+            return task.delayMs;
+        }
+    };
 }
 
 function startEvent(token) {
@@ -137,6 +174,18 @@ function findInitialGreeting(upstream) {
         && event.response?.metadata?.response_purpose === 'initial_greeting'
     ));
 }
+
+test('search cue synthesis produces a quiet-edged PCMU pulse without an audio asset', () => {
+    const cue = buildSearchPulsePcmu();
+    assert.equal(pcm16ToMulaw(0), 0xff);
+    assert.equal(pcm16ToMulaw(32635), 0x80);
+    assert.equal(pcm16ToMulaw(-32635), 0x00);
+    assert.equal(cue.length, 4160);
+    assert.equal(cue.length % 160, 0);
+    assert.equal(cue[0], 0xff);
+    assert.equal(cue.at(-1), 0xff);
+    assert.ok(cue.some((sample) => sample !== 0xff));
+});
 
 test('session update configures PCMU, transcription, VAD, reasoning, and the deep tool', () => {
     const event = buildSessionUpdate();
@@ -1051,6 +1100,7 @@ test('idle timeout events are ignored while a deep answer is still running', asy
     aiService.answerComplexVoice = (args) => {
         aiService.calls.push(args);
         aiService.lastArgs = args;
+        args.onWebSearchStart?.();
         return new Promise((resolve) => {
             resolveDeepAnswer = resolve;
         });
@@ -1081,6 +1131,182 @@ test('idle timeout events are ignored while a deep answer is still running', asy
         JSON.parse(upstream.sent.find((event) => event.item?.call_id === 'slow-search-call').item.output).answer,
         'Markets are mixed today.'
     );
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('an actual web search event plays a paced status cue and stops it before the answer', async () => {
+    const cueTimers = createFakeCueTimerApi();
+    const searchCuePcmu = Buffer.concat([
+        Buffer.alloc(160, 0x81),
+        Buffer.alloc(160, 0x82)
+    ]);
+    const { bridge, upstream, twilioSocket, aiService, state } = createHarness({
+        bridgeOptions: {
+            cueTimerApi: cueTimers.api,
+            searchCueDelayMs: 650,
+            searchCueGapMs: 1500,
+            searchCuePcmu
+        }
+    });
+    let resolveDeepAnswer;
+    aiService.answerComplexVoice = (args) => {
+        aiService.calls.push(args);
+        aiService.lastArgs = args;
+        args.onWebSearchStart?.();
+        return new Promise((resolve) => {
+            resolveDeepAnswer = resolve;
+        });
+    };
+    completeSetup(upstream);
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            status: 'completed',
+            output: [{
+                type: 'function_call',
+                name: 'answer_complex_question',
+                call_id: 'search-cue-call',
+                arguments: JSON.stringify({ question: 'Tell me about the Larkspur-9 protocol.' })
+            }]
+        }
+    });
+
+    assert.equal(cueTimers.size, 1);
+    assert.equal(cueTimers.nextDelay(), 650);
+    assert.equal(twilioSocket.sent.some((event) => event.event === 'media'), false);
+
+    assert.equal(cueTimers.runNext(), 650);
+    const firstFrame = twilioSocket.sent.find((event) => event.event === 'media');
+    assert.deepEqual(Buffer.from(firstFrame.media.payload, 'base64'), Buffer.alloc(160, 0x81));
+    assert.equal(cueTimers.nextDelay(), 20);
+    assert.equal(cueTimers.runNext(), 20);
+    assert.equal(cueTimers.nextDelay(), 1500);
+    assert.equal(twilioSocket.sent.filter((event) => event.event === 'media').length, 2);
+    assert.equal(state.currentItemId, null);
+    assert.equal(state.audioSentMs, 0);
+    assert.equal(state.pendingMarks.size, 0);
+
+    resolveDeepAnswer({ answer: 'Technology stocks are mixed today.', usageTokens: 10, searched: true });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(cueTimers.size, 0);
+    assert.equal(cueTimers.runNext(), null);
+    assert.equal(twilioSocket.sent.filter((event) => event.event === 'media').length, 2);
+    const cueMark = twilioSocket.sent.find((event) => event.event === 'mark'
+        && event.mark?.name.startsWith('search-cue-'));
+    assert.ok(cueMark);
+    assert.equal(state.pendingSearchCueMarks.size, 1);
+    assert.equal(
+        JSON.parse(upstream.sent.find((event) => event.item?.call_id === 'search-cue-call').item.output).answer,
+        'Technology stocks are mixed today.'
+    );
+    assert.deepEqual(upstream.sent.at(-1), { type: 'response.create' });
+
+    twilioSocket.receive({
+        event: 'mark',
+        streamSid: 'MZ123',
+        mark: { name: cueMark.mark.name }
+    });
+    assert.equal(state.pendingSearchCueMarks.size, 0);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('caller speech clears search-cue audio still buffered after the search finishes', async () => {
+    const cueTimers = createFakeCueTimerApi();
+    const { bridge, upstream, twilioSocket, aiService, state } = createHarness({
+        bridgeOptions: {
+            cueTimerApi: cueTimers.api,
+            searchCueDelayMs: 0,
+            searchCuePcmu: Buffer.alloc(160, 0x84)
+        }
+    });
+    let resolveDeepAnswer;
+    aiService.answerComplexVoice = (args) => {
+        aiService.calls.push(args);
+        aiService.lastArgs = args;
+        args.onWebSearchStart?.();
+        return new Promise((resolve) => {
+            resolveDeepAnswer = resolve;
+        });
+    };
+    completeSetup(upstream);
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            status: 'completed',
+            output: [{
+                type: 'function_call',
+                name: 'answer_complex_question',
+                call_id: 'buffered-search-cue',
+                arguments: JSON.stringify({ question: 'What is the market doing now?' })
+            }]
+        }
+    });
+    cueTimers.runNext();
+    resolveDeepAnswer({ answer: 'Markets are mixed.', usageTokens: 10, searched: true });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(state.searchCueActive, false);
+    assert.equal(state.pendingSearchCueMarks.size, 1);
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+
+    assert.equal(twilioSocket.sent.filter((event) => event.event === 'clear').length, 1);
+    assert.equal(upstream.sent.some((event) => event.type === 'conversation.item.truncate'), false);
+    assert.equal(state.pendingSearchCueMarks.size, 0);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('caller speech immediately clears a playing search cue without truncating assistant audio', async () => {
+    const cueTimers = createFakeCueTimerApi();
+    const { bridge, upstream, twilioSocket, aiService, state } = createHarness({
+        bridgeOptions: {
+            cueTimerApi: cueTimers.api,
+            searchCueDelayMs: 0,
+            searchCuePcmu: Buffer.alloc(160, 0x83)
+        }
+    });
+    aiService.answerComplexVoice = (args) => {
+        aiService.calls.push(args);
+        aiService.lastArgs = args;
+        args.onWebSearchStart?.();
+        return new Promise((resolve, reject) => {
+            args.signal.addEventListener('abort', () => {
+                reject(Object.assign(new Error('cancelled'), { code: 'AI_ABORTED' }));
+            }, { once: true });
+        });
+    };
+    completeSetup(upstream);
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            status: 'completed',
+            output: [{
+                type: 'function_call',
+                name: 'answer_complex_question',
+                call_id: 'interrupted-search-cue',
+                arguments: JSON.stringify({ question: 'Look up the latest market news.' })
+            }]
+        }
+    });
+    cueTimers.runNext();
+    assert.equal(twilioSocket.sent.filter((event) => event.event === 'media').length, 1);
+
+    upstream.receive({ type: 'input_audio_buffer.speech_started' });
+    assert.equal(aiService.lastArgs.signal.aborted, true);
+    assert.equal(cueTimers.size, 0);
+    assert.equal(twilioSocket.sent.filter((event) => event.event === 'clear').length, 1);
+    assert.equal(upstream.sent.some((event) => event.type === 'conversation.item.truncate'), false);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(state.deepToolInFlight, false);
+    assert.equal(cueTimers.runNext(), null);
+    assert.equal(twilioSocket.sent.filter((event) => event.event === 'media').length, 1);
 
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     bridge.close();

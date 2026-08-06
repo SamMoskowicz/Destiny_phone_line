@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -50,6 +51,7 @@ test('obvious lookup and changing-information questions require web search', () 
         'What is the latest market news?',
         'Who is the CEO of Example Corp?',
         'What is the weather tomorrow?',
+        'How are those technology stocks doing?',
         'Summarize https://example.com/report'
     ]) {
         assert.equal(requiresWebSearch(question), true, question);
@@ -226,6 +228,60 @@ test('deep voice answers use the frontier model without storing the response', a
     assert.match(client.calls[0].params.input, /Recent conversation context/);
     assert.equal(Object.hasOwn(client.calls[0].params, 'max_output_tokens'), false);
     assert.equal(client.calls[0].params.store, false);
+});
+
+test('deep voice reports the actual start of a streamed web search exactly once', async () => {
+    const calls = [];
+    const client = {
+        responses: {
+            stream(params, options) {
+                calls.push({ params, options });
+                const stream = new EventEmitter();
+                stream.finalResponse = async () => {
+                    stream.emit('event', {
+                        type: 'response.web_search_call.in_progress',
+                        item_id: 'ws-1'
+                    });
+                    stream.emit('event', {
+                        type: 'response.web_search_call.in_progress',
+                        item_id: 'ws-1'
+                    });
+                    return {
+                        status: 'completed',
+                        output_text: 'It will be sunny today.',
+                        output: [
+                            { type: 'web_search_call', status: 'completed' },
+                            {
+                                type: 'message',
+                                content: [{
+                                    type: 'output_text',
+                                    text: 'It will be sunny today.',
+                                    annotations: []
+                                }]
+                            }
+                        ]
+                    };
+                };
+                return stream;
+            }
+        }
+    };
+    const service = new AiService({ client });
+    let searchStarts = 0;
+
+    const result = await service.answerComplexVoice({
+        safetyIdentifier: 'usr_streamed_search',
+        question: 'What is the weather today?',
+        onWebSearchStart: () => {
+            searchStarts += 1;
+        }
+    });
+
+    assert.equal(searchStarts, 1);
+    assert.equal(result.answer, 'It will be sunny today.');
+    assert.equal(result.searched, true);
+    assert.equal(calls[0].params.tool_choice, 'required');
+    assert.ok(calls[0].options.signal instanceof AbortSignal);
 });
 
 test('deep voice memory stays in user-level input instead of developer instructions', async () => {
