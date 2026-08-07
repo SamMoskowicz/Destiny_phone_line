@@ -142,13 +142,39 @@ test('builds bidirectional AI Stream TwiML without a robotic preamble', () => {
     const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
     const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
 
-    const twiml = service.buildAiStreamTwiML('wss://example.com/voice/ai-stream?x=1&y=2', 'token"value');
+    const twiml = service.buildAiStreamTwiML(
+        'wss://example.com/voice/ai-stream?x=1&y=2',
+        'token"value',
+        { recoveryAttempt: 0 }
+    );
     assert.match(twiml, /<Connect>/);
     assert.match(twiml, /<Stream url="wss:\/\/example\.com\/voice\/ai-stream\?x=1&amp;y=2">/);
     assert.match(twiml, /name="sessionToken" value="token&quot;value"/);
+    assert.match(twiml, /name="recoveryAttempt" value="0"/);
     assert.doesNotMatch(twiml, /<Say/i);
     assert.doesNotMatch(twiml, /speaking with ChatGPT/i);
-    assert.match(twiml, /<Redirect method="POST">\/voice\/menu<\/Redirect>/);
+    assert.match(twiml, /<Redirect method="POST">\/voice\/ai-resume\?attempt=1<\/Redirect>/);
+    assert.doesNotMatch(twiml, /<Redirect method="POST">\/voice\/menu<\/Redirect>/);
+
+    if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+    }
+});
+
+test('AI recovery is bounded and ends the call instead of falling into the menu', () => {
+    const tempFile = path.join(os.tmpdir(), `phone-service-${Date.now()}-${Math.random()}.json`);
+    const service = new PhoneService({ streamerName: 'Destiny', storageFile: tempFile });
+
+    const retryTwiml = service.buildAiStreamTwiML('wss://example.com/voice/ai-stream', 'token', {
+        recoveryAttempt: 1
+    });
+    const endedTwiml = service.buildAiSessionEndedTwiML('AI <offline>');
+
+    assert.match(retryTwiml, /name="recoveryAttempt" value="1"/);
+    assert.match(retryTwiml, /\/voice\/ai-resume\?attempt=2/);
+    assert.match(endedTwiml, /AI &lt;offline&gt;/);
+    assert.match(endedTwiml, /<Hangup\/>/);
+    assert.doesNotMatch(endedTwiml, /voice\/menu/);
 
     if (fs.existsSync(tempFile)) {
         fs.unlinkSync(tempFile);

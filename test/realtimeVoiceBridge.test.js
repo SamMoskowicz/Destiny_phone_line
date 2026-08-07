@@ -81,14 +81,17 @@ function createFakeCueTimerApi() {
     };
 }
 
-function startEvent(token) {
+function startEvent(token, { recoveryAttempt = 0 } = {}) {
     return {
         event: 'start',
         streamSid: 'MZ123',
         start: {
             callSid: 'CA123',
             streamSid: 'MZ123',
-            customParameters: { sessionToken: token },
+            customParameters: {
+                sessionToken: token,
+                recoveryAttempt: String(recoveryAttempt)
+            },
             mediaFormat: {
                 encoding: 'audio/x-mulaw',
                 sampleRate: 8000,
@@ -106,6 +109,7 @@ function createHarness({
     memoryContext = '',
     memoryGeneration = 0,
     persistentMemory = true,
+    recoveryAttempt = 0,
     bridgeOptions = {}
 } = {}) {
     const tokenStore = new EphemeralSessionTokenStore();
@@ -151,7 +155,7 @@ function createHarness({
     const twilioSocket = new FakeWebSocket();
     const state = bridge.acceptTwilioSocket(twilioSocket);
     twilioSocket.receive({ event: 'connected' });
-    twilioSocket.receive(startEvent(token));
+    twilioSocket.receive(startEvent(token, { recoveryAttempt }));
     return { bridge, upstream, twilioSocket, aiService, state, connection: () => connection };
 }
 
@@ -241,6 +245,22 @@ test('accepted Realtime setup requests one short proactive audio greeting', () =
     assert.equal(upstream.sent.filter((event) => (
         event.response?.metadata?.response_purpose === 'initial_greeting'
     )).length, 1);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('a replacement Twilio stream identifies itself as recovery instead of greeting from scratch', () => {
+    const { bridge, upstream, twilioSocket } = createHarness({ recoveryAttempt: 1 });
+    completeSetup(upstream);
+
+    const recoveryGreeting = upstream.sent.find((event) => (
+        event.type === 'response.create'
+        && event.response?.metadata?.response_purpose === 'connection_recovery'
+    ));
+    assert.ok(recoveryGreeting);
+    assert.match(recoveryGreeting.response.instructions, /repeat your last question/i);
+    assert.equal(findInitialGreeting(upstream), undefined);
 
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     bridge.close();
@@ -946,7 +966,7 @@ test('a silent caller gets two idle prompts before the third timeout closes the 
     bridge.close();
 });
 
-test('a Realtime error after setup closes both sockets and releases the call slot', () => {
+test('a recoverable Realtime error is logged without ending the call', () => {
     const { bridge, upstream, twilioSocket } = createHarness();
     completeSetup(upstream);
     upstream.receive({
@@ -954,9 +974,152 @@ test('a Realtime error after setup closes both sockets and releases the call slo
         error: { type: 'server_error', code: 'server_error' }
     });
 
+    const callerAudio = Buffer.alloc(160, 11).toString('base64');
+    twilioSocket.receive({ event: 'media', streamSid: 'MZ123', media: { payload: callerAudio } });
+
+    assert.equal(bridge.activeSessionCount, 1);
+    assert.equal(twilioSocket.readyState, 1);
+    assert.equal(upstream.readyState, 1);
+    assert.ok(upstream.sent.some((event) => (
+        event.type === 'input_audio_buffer.append' && event.audio === callerAudio
+    )));
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('an unexpected OpenAI disconnect reconnects without closing the Twilio call', () => {
+    const reconnectTimers = createFakeCueTimerApi();
+    const sockets = [new FakeWebSocket(0), new FakeWebSocket(0)];
+    let connectionIndex = 0;
+    const { bridge, twilioSocket, state } = createHarness({
+        bridgeOptions: {
+            maxOpenAiReconnects: 2,
+            openAiReconnectDelayMs: 250,
+            reconnectTimerApi: reconnectTimers.api,
+            openAiSocketFactory: () => sockets[connectionIndex++]
+        }
+    });
+    completeSetup(sockets[0]);
+
+    sockets[0].close(1011, 'temporary upstream failure');
+
+    assert.equal(bridge.activeSessionCount, 1);
+    assert.equal(twilioSocket.readyState, 1);
+    assert.equal(state.finished, false);
+    assert.equal(reconnectTimers.size, 1);
+    assert.equal(reconnectTimers.nextDelay(), 250);
+    assert.ok(twilioSocket.sent.some((event) => event.event === 'clear'));
+
+    reconnectTimers.runNext();
+    assert.equal(state.openAiSocket, sockets[1]);
+    completeSetup(sockets[1]);
+
+    const recoveryGreeting = sockets[1].sent.find((event) => (
+        event.type === 'response.create'
+        && event.response?.metadata?.response_purpose === 'connection_recovery'
+    ));
+    assert.ok(recoveryGreeting);
+    assert.match(recoveryGreeting.response.instructions, /repeat your last question/i);
+    assert.equal(bridge.activeSessionCount, 1);
+    assert.equal(twilioSocket.readyState, 1);
+
+    sockets[1].receive({ type: 'response.created', response: { id: 'healthy-response' } });
+    sockets[1].receive({
+        type: 'response.done',
+        response: { id: 'healthy-response', status: 'completed', usage: { total_tokens: 2 }, output: [] }
+    });
+    assert.equal(state.openAiReconnectAttempts, 0);
+
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('OpenAI reconnect attempts are bounded and request TwiML recovery when exhausted', () => {
+    const reconnectTimers = createFakeCueTimerApi();
+    const sockets = [new FakeWebSocket(0), new FakeWebSocket(0)];
+    let connectionIndex = 0;
+    const { bridge, twilioSocket } = createHarness({
+        bridgeOptions: {
+            maxOpenAiReconnects: 1,
+            reconnectTimerApi: reconnectTimers.api,
+            openAiSocketFactory: () => sockets[connectionIndex++]
+        }
+    });
+    completeSetup(sockets[0]);
+    sockets[0].close(1011, 'first failure');
+    reconnectTimers.runNext();
+    sockets[1].close(1011, 'second failure');
+
     assert.equal(bridge.activeSessionCount, 0);
     assert.equal(twilioSocket.readyState, 3);
-    assert.equal(upstream.readyState, 3);
+    assert.equal(reconnectTimers.size, 0);
+    assert.deepEqual(bridge.getSessionEnd('CA123'), {
+        disposition: 'recover',
+        reason: 'AI connection unavailable'
+    });
+    bridge.close();
+});
+
+test('pressing 8 is the only AI stream exit that deliberately returns to the menu', () => {
+    const { bridge, upstream, twilioSocket } = createHarness();
+    completeSetup(upstream);
+
+    twilioSocket.receive({ event: 'dtmf', streamSid: 'MZ123', dtmf: { digit: '8' } });
+
+    assert.equal(bridge.activeSessionCount, 0);
+    assert.deepEqual(bridge.getSessionEnd('CA123'), {
+        disposition: 'menu',
+        reason: 'return to menu'
+    });
+    bridge.close();
+});
+
+test('session-end diagnostics retain the prior phase and sanitized close details', () => {
+    const entries = [];
+    const { bridge, upstream, twilioSocket } = createHarness({
+        bridgeOptions: {
+            logger: {
+                warn() {},
+                info(event, details) {
+                    entries.push({ event, details });
+                }
+            }
+        }
+    });
+    completeSetup(upstream);
+
+    twilioSocket.close(1011, 'carrier stream ended');
+
+    const finished = entries.find((entry) => entry.event === '[ai-voice] session_finished');
+    assert.ok(finished);
+    assert.equal(finished.details.previousPhase, 'active');
+    assert.equal(finished.details.source, 'twilio_close');
+    assert.equal(finished.details.closeCode, '1011');
+    assert.equal(finished.details.closeReason, 'carrier stream ended');
+    assert.equal(finished.details.deepToolInFlight, 'false');
+    assert.equal(Object.hasOwn(finished.details, 'phoneNumber'), false);
+    bridge.close();
+});
+
+test('one failed Realtime response does not terminate an otherwise healthy session', () => {
+    const { bridge, upstream, twilioSocket } = createHarness();
+    completeSetup(upstream);
+
+    upstream.receive({
+        type: 'response.done',
+        response: {
+            id: 'response-failed-once',
+            status: 'failed',
+            status_details: { error: { code: 'server_error' } },
+            usage: { total_tokens: 3 },
+            output: []
+        }
+    });
+
+    assert.equal(bridge.activeSessionCount, 1);
+    assert.equal(twilioSocket.readyState, 1);
+    assert.equal(upstream.readyState, 1);
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     bridge.close();
 });
 
@@ -1454,6 +1617,54 @@ test('a stale deep result is cancelled before the newer caller turn is answered'
         String(event.item?.output || '').includes('This stale answer must not be spoken.')
     )), false);
 
+    twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
+    bridge.close();
+});
+
+test('a search result from a disconnected OpenAI generation is never sent to its replacement', async () => {
+    let resolveAnswer;
+    const answerPromise = new Promise((resolve) => {
+        resolveAnswer = resolve;
+    });
+    const reconnectTimers = createFakeCueTimerApi();
+    const sockets = [new FakeWebSocket(0), new FakeWebSocket(0)];
+    let connectionIndex = 0;
+    const deferredAiService = {
+        isConfigured: () => true,
+        answerComplexVoice: () => answerPromise
+    };
+    const { bridge, twilioSocket } = createHarness({
+        bridgeOptions: {
+            aiService: deferredAiService,
+            reconnectTimerApi: reconnectTimers.api,
+            openAiSocketFactory: () => sockets[connectionIndex++]
+        }
+    });
+    completeSetup(sockets[0]);
+    sockets[0].receive({
+        type: 'response.done',
+        response: {
+            status: 'completed',
+            output: [{
+                id: 'old-search-item',
+                type: 'function_call',
+                name: 'answer_complex_question',
+                call_id: 'old-search-call',
+                arguments: JSON.stringify({ question: 'What changed today?' })
+            }]
+        }
+    });
+
+    sockets[0].close(1011, 'search connection lost');
+    reconnectTimers.runNext();
+    completeSetup(sockets[1]);
+    resolveAnswer({ answer: 'This belongs to the old socket.', usageTokens: 10, searched: true });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(sockets[1].sent.some((event) => event.item?.call_id === 'old-search-call'), false);
+    assert.equal(sockets[1].sent.some((event) => (
+        String(event.item?.output || '').includes('This belongs to the old socket.')
+    )), false);
     twilioSocket.receive({ event: 'stop', streamSid: 'MZ123' });
     bridge.close();
 });

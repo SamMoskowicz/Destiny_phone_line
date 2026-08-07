@@ -1,7 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { parseBody, buildSmsTwiML, buildAiWebSocketUrl } = require('../server');
+const {
+    parseBody,
+    parseAiResumeAttempt,
+    resolveAiResumeAction,
+    buildSmsTwiML,
+    buildAiWebSocketUrl
+} = require('../server');
 
 function requestWithBody(body, contentType = 'application/x-www-form-urlencoded') {
     const req = Readable.from([Buffer.from(body)]);
@@ -53,4 +59,26 @@ test('AI Media Stream URL uses WSS and never includes credentials', () => {
             process.env.PUBLIC_BASE_URL = previous;
         }
     }
+});
+
+test('AI resume attempts are parsed and bounded', () => {
+    assert.equal(parseAiResumeAttempt({ url: '/voice/ai-resume?attempt=1' }), 1);
+    assert.equal(parseAiResumeAttempt({ url: '/voice/ai-resume?attempt=99' }), 10);
+    assert.equal(parseAiResumeAttempt({ url: '/voice/ai-resume?attempt=-2' }), 0);
+    assert.equal(parseAiResumeAttempt({ url: '/voice/ai-resume?attempt=oops' }), 0);
+});
+
+test('AI resume routing returns to the menu only for an explicit menu disposition', () => {
+    const base = { callSid: 'CA123', recoveryAttempt: 1, maxAttempts: 1 };
+    assert.equal(resolveAiResumeAction({
+        ...base,
+        sessionEnd: { disposition: 'menu' }
+    }), 'menu');
+    assert.equal(resolveAiResumeAction({
+        ...base,
+        sessionEnd: { disposition: 'end' }
+    }), 'end');
+    assert.equal(resolveAiResumeAction({ ...base, sessionEnd: null }), 'recover');
+    assert.equal(resolveAiResumeAction({ ...base, callSid: '' }), 'unavailable');
+    assert.equal(resolveAiResumeAction({ ...base, recoveryAttempt: 2 }), 'unavailable');
 });

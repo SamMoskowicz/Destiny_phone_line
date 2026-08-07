@@ -25,6 +25,12 @@ services:
         value: "650"
       - key: AI_VOICE_SEARCH_CUE_GAP_MS
         value: "1500"
+      - key: AI_VOICE_MAX_OPENAI_RECONNECTS
+        value: "2"
+      - key: AI_VOICE_OPENAI_RECONNECT_DELAY_MS
+        value: "250"
+      - key: AI_VOICE_MAX_RESUME_ATTEMPTS
+        value: "1"
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN

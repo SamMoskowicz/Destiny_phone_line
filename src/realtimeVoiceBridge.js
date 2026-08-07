@@ -37,6 +37,10 @@ ${CONTINUATION_SUFFIX}`;
 const INITIAL_GREETING_PURPOSE = 'initial_greeting';
 const INITIAL_GREETING_INSTRUCTIONS = `Say exactly this short, natural greeting: "Hi! How can I
 help?" Do not add anything else and do not call a tool.`;
+const RECOVERY_GREETING_PURPOSE = 'connection_recovery';
+const RECOVERY_GREETING_INSTRUCTIONS = `Say exactly this short, natural message: "Sorry, the AI
+connection restarted. Please repeat your last question." Do not add anything else and do not call
+a tool.`;
 
 function asInteger(value, fallback, minimum, maximum) {
     const number = Number(value);
@@ -97,6 +101,23 @@ const DEFAULT_CUE_TIMER_API = Object.freeze({
     setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
     clearTimeout: (timer) => clearTimeout(timer)
 });
+
+function isGreetingPurpose(value) {
+    return [INITIAL_GREETING_PURPOSE, RECOVERY_GREETING_PURPOSE].includes(String(value || ''));
+}
+
+function isNonRecoverableRealtimeError(error = {}) {
+    const identifier = `${error.type || ''} ${error.code || ''}`.toLowerCase();
+    return [
+        'authentication',
+        'invalid_api_key',
+        'permission',
+        'policy',
+        'safety',
+        'billing',
+        'insufficient_quota'
+    ].some((value) => identifier.includes(value));
+}
 
 function realtimeReasoningEffort(value) {
     return ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value) ? value : 'low';
@@ -277,11 +298,15 @@ class RealtimeVoiceBridge {
         maxIdlePrompts = process.env.AI_VOICE_MAX_IDLE_PROMPTS || 2,
         maxBufferedBytes = process.env.AI_VOICE_MAX_BUFFERED_BYTES || 1024 * 1024,
         maxPendingAudioBytes = process.env.AI_VOICE_MAX_PENDING_AUDIO_BYTES || 32768,
+        maxOpenAiReconnects = process.env.AI_VOICE_MAX_OPENAI_RECONNECTS || 2,
+        openAiReconnectDelayMs = process.env.AI_VOICE_OPENAI_RECONNECT_DELAY_MS || 250,
+        sessionEndTtlMs = process.env.AI_VOICE_SESSION_END_TTL_MS || 120000,
         searchCueEnabled = process.env.AI_VOICE_SEARCH_CUE_ENABLED !== 'false',
         searchCueDelayMs = process.env.AI_VOICE_SEARCH_CUE_DELAY_MS || 650,
         searchCueGapMs = process.env.AI_VOICE_SEARCH_CUE_GAP_MS || 1500,
         searchCuePcmu = DEFAULT_SEARCH_PULSE_PCMU,
         cueTimerApi = DEFAULT_CUE_TIMER_API,
+        reconnectTimerApi = DEFAULT_CUE_TIMER_API,
         openAiSocketFactory = (url, options) => new WebSocket(url, options),
         logger = console,
         clock = () => Date.now()
@@ -305,6 +330,9 @@ class RealtimeVoiceBridge {
         this.maxIdlePrompts = asInteger(maxIdlePrompts, 2, 0, 10);
         this.maxBufferedBytes = asInteger(maxBufferedBytes, 1024 * 1024, 65536, 16 * 1024 * 1024);
         this.maxPendingAudioBytes = asInteger(maxPendingAudioBytes, 32768, 4096, 1024 * 1024);
+        this.maxOpenAiReconnects = asInteger(maxOpenAiReconnects, 2, 0, 10);
+        this.openAiReconnectDelayMs = asInteger(openAiReconnectDelayMs, 250, 50, 10000);
+        this.sessionEndTtlMs = asInteger(sessionEndTtlMs, 120000, 10000, 10 * 60 * 1000);
         this.searchCueEnabled = searchCueEnabled !== false && searchCueEnabled !== 'false';
         this.searchCueDelayMs = asInteger(searchCueDelayMs, 650, 0, 5000);
         this.searchCueGapMs = asInteger(searchCueGapMs, 1500, 300, 10000);
@@ -319,12 +347,18 @@ class RealtimeVoiceBridge {
             && typeof cueTimerApi.clearTimeout === 'function'
             ? cueTimerApi
             : DEFAULT_CUE_TIMER_API;
+        this.reconnectTimerApi = reconnectTimerApi
+            && typeof reconnectTimerApi.setTimeout === 'function'
+            && typeof reconnectTimerApi.clearTimeout === 'function'
+            ? reconnectTimerApi
+            : DEFAULT_CUE_TIMER_API;
         this.openAiSocketFactory = openAiSocketFactory;
         this.logger = logger;
         this.clock = clock;
         this.sessions = new Map();
         this.activeByUser = new Map();
         this.pendingStates = new Set();
+        this.sessionEnds = new Map();
         this.server = null;
         this.upgradeHandler = null;
         this.wss = new WebSocketServer({
@@ -397,6 +431,11 @@ class RealtimeVoiceBridge {
             twilioSocket,
             openAiSocket: null,
             openAiReady: false,
+            openAiGeneration: 0,
+            openAiReconnectAttempts: 0,
+            openAiReconnectTimer: null,
+            hasCompletedOpenAiSetup: false,
+            recoveryGreetingPending: false,
             phase: 'awaiting_connected',
             callSid: null,
             streamSid: null,
@@ -404,6 +443,7 @@ class RealtimeVoiceBridge {
             memoryGeneration: 0,
             memoryContext: '',
             memoryContextAdded: false,
+            recoveryContextAdded: false,
             memorySessionId: crypto.randomBytes(12).toString('hex'),
             discardMemory: false,
             pendingAudio: [],
@@ -478,8 +518,17 @@ class RealtimeVoiceBridge {
         state.startTimer.unref?.();
 
         twilioSocket.on('message', (data) => this.handleTwilioMessage(state, data));
-        twilioSocket.on('close', () => this.finish(state, { closeOpenAi: true }));
-        twilioSocket.on('error', () => this.finish(state, { closeOpenAi: true }));
+        twilioSocket.on('close', (closeCode, closeReason) => this.finish(state, {
+            source: 'twilio_close',
+            closeCode,
+            closeReason: Buffer.isBuffer(closeReason) ? closeReason.toString('utf8') : closeReason,
+            closeOpenAi: true
+        }));
+        twilioSocket.on('error', (error) => this.finish(state, {
+            source: 'twilio_error',
+            closeCode: error?.code,
+            closeOpenAi: true
+        }));
         return state;
     }
 
@@ -531,7 +580,13 @@ class RealtimeVoiceBridge {
         } else if (event.event === 'mark') {
             this.acknowledgeMark(state, event.mark?.name);
         } else if (event.event === 'dtmf' && String(event.dtmf?.digit) === '8') {
-            this.finish(state, { code: 1000, reason: 'return to menu', closeTwilio: true, closeOpenAi: true });
+            this.finish(state, {
+                code: 1000,
+                reason: 'return to menu',
+                disposition: 'menu',
+                closeTwilio: true,
+                closeOpenAi: true
+            });
         } else if (event.event === 'stop') {
             this.finish(state, { code: 1000, reason: 'call stopped', closeTwilio: true, closeOpenAi: true });
         }
@@ -552,6 +607,7 @@ class RealtimeVoiceBridge {
             || this.sessions.has(callSid)
             || this.activeByUser.has(tokenEntry.safetyIdentifier)
             || this.sessions.size >= this.maxSessions) {
+            this.rememberSessionEnd(callSid, 'end', 'unauthorized stream');
             this.finish(state, { code: 1008, reason: 'unauthorized stream', closeTwilio: true, closeOpenAi: true });
             return;
         }
@@ -562,18 +618,30 @@ class RealtimeVoiceBridge {
         state.callSid = callSid;
         state.streamSid = streamSid;
         state.safetyIdentifier = tokenEntry.safetyIdentifier;
+        state.twimlRecoveryAttempt = asInteger(
+            start.customParameters?.recoveryAttempt ?? start.customParameters?.recoveryattempt,
+            0,
+            0,
+            10
+        );
+        state.recoveryGreetingPending = state.twimlRecoveryAttempt > 0;
         const memorySnapshot = this.aiService?.getMemorySnapshot?.(state.safetyIdentifier);
         if (memorySnapshot && typeof memorySnapshot === 'object') {
             state.memoryGeneration = Number(memorySnapshot.generation) || 0;
             state.memoryContext = String(memorySnapshot.context || '');
         }
         this.pendingStates.delete(state);
+        this.sessionEnds.delete(callSid);
         this.sessions.set(callSid, state);
         this.activeByUser.set(state.safetyIdentifier, callSid);
         this.openOpenAiSocket(state);
     }
 
     openOpenAiSocket(state) {
+        if (state.finished) {
+            return;
+        }
+        state.openAiGeneration += 1;
         const separator = this.openAiUrl.includes('?') ? '&' : '?';
         const url = `${this.openAiUrl}${separator}model=${encodeURIComponent(this.model)}`;
         let socket;
@@ -588,24 +656,24 @@ class RealtimeVoiceBridge {
             });
         } catch (error) {
             this.logWarning('openai_socket_create_failed', error?.code);
-            this.finish(state, { code: 1011, reason: 'AI unavailable', closeTwilio: true, closeOpenAi: true });
+            this.recoverOpenAiConnection(state, null, {
+                source: 'socket_create',
+                code: error?.code
+            });
             return;
         }
         state.openAiSocket = socket;
-        state.openAiTimer = setTimeout(() => this.finish(state, {
-            code: 1011,
-            reason: 'AI connection timeout',
-            closeTwilio: true,
-            closeOpenAi: true
+        state.openAiTimer = setTimeout(() => this.recoverOpenAiConnection(state, socket, {
+            source: 'connection_timeout'
         }), 5000);
         state.openAiTimer.unref?.();
         socket.on('open', () => {
-            clearTimeout(state.openAiTimer);
-            state.openAiTimer = null;
-            if (state.finished) {
+            if (state.finished || state.openAiSocket !== socket) {
                 closeSocket(socket);
                 return;
             }
+            clearTimeout(state.openAiTimer);
+            state.openAiTimer = null;
             const update = buildSessionUpdate({
                 voice: this.voice,
                 reasoningEffort: this.reasoningEffort,
@@ -615,28 +683,120 @@ class RealtimeVoiceBridge {
                 enableDeepTool: Boolean(this.aiService?.isConfigured?.())
             });
             if (!sendJson(socket, update, this.maxBufferedBytes)) {
-                this.finish(state, { code: 1011, reason: 'AI backpressure', closeTwilio: true, closeOpenAi: true });
+                this.recoverOpenAiConnection(state, socket, { source: 'session_update_backpressure' });
                 return;
             }
             // Audio remains queued until session.updated confirms PCMU was accepted.
-            state.sessionReadyTimer = setTimeout(() => this.finish(state, {
-                code: 1011,
-                reason: 'AI setup timeout',
-                closeTwilio: true,
-                closeOpenAi: true
+            state.sessionReadyTimer = setTimeout(() => this.recoverOpenAiConnection(state, socket, {
+                source: 'setup_timeout'
             }), 3000);
             state.sessionReadyTimer.unref?.();
         });
-        socket.on('message', (data) => this.handleOpenAiMessage(state, data));
-        socket.on('close', () => this.finish(state, {
-            code: 1011,
-            reason: 'AI disconnected',
-            closeTwilio: true
+        socket.on('message', (data) => {
+            if (state.openAiSocket === socket) {
+                this.handleOpenAiMessage(state, data);
+            }
+        });
+        socket.on('close', (closeCode, closeReason) => this.recoverOpenAiConnection(state, socket, {
+            source: 'socket_close',
+            closeCode,
+            closeReason: Buffer.isBuffer(closeReason) ? closeReason.toString('utf8') : closeReason
         }));
         socket.on('error', (error) => {
             this.logWarning('openai_socket_error', error?.code);
-            this.finish(state, { code: 1011, reason: 'AI unavailable', closeTwilio: true, closeOpenAi: true });
+            this.recoverOpenAiConnection(state, socket, {
+                source: 'socket_error',
+                closeCode: error?.code
+            });
         });
+    }
+
+    recoverOpenAiConnection(state, socket, {
+        source = 'unknown',
+        code = undefined,
+        closeCode = undefined,
+        closeReason = undefined
+    } = {}) {
+        if (state.finished || (socket && state.openAiSocket !== socket)) {
+            return false;
+        }
+        clearTimeout(state.openAiTimer);
+        clearTimeout(state.sessionReadyTimer);
+        state.openAiTimer = null;
+        state.sessionReadyTimer = null;
+
+        const failedSocket = socket || state.openAiSocket;
+        state.openAiSocket = null;
+        state.openAiReady = false;
+        if (state.openAiReconnectAttempts >= this.maxOpenAiReconnects) {
+            this.logVoiceEvent('openai_reconnect_exhausted', state, {
+                source,
+                code,
+                closeCode,
+                closeReason,
+                attempts: state.openAiReconnectAttempts
+            });
+            closeSocket(failedSocket, 1011, 'AI unavailable');
+            this.finish(state, {
+                code: 1011,
+                reason: 'AI connection unavailable',
+                disposition: 'recover',
+                source: `openai_${source}`,
+                closeCode: closeCode ?? code,
+                closeReason,
+                closeTwilio: true,
+                closeOpenAi: true
+            });
+            return false;
+        }
+
+        state.openAiReconnectAttempts += 1;
+        state.recoveryGreetingPending = state.hasCompletedOpenAiSetup
+            || state.recoveryGreetingPending;
+        state.memoryContextAdded = false;
+        state.recoveryContextAdded = false;
+        state.turnEpoch += 1;
+        state.continuationCount = 0;
+        state.deepToolAbortController?.abort('AI connection restarted');
+        state.deepToolAbortController = null;
+        state.deepToolInFlight = false;
+        state.pendingTurnDuringTool = false;
+        this.stopSearchCue(state, { trackBuffered: false });
+        if (state.twilioSocket?.readyState === OPEN) {
+            sendJson(state.twilioSocket, {
+                event: 'clear',
+                streamSid: state.streamSid
+            }, this.maxBufferedBytes);
+        }
+        state.inputItemEpochs.clear();
+        state.finalizedResponses.clear();
+        state.handledCallIds.clear();
+        state.interruptedItemIds.clear();
+        state.responseStates.clear();
+        state.pendingMarks.clear();
+        this.beginAssistantItem(state, null);
+        closeSocket(failedSocket, 1011, 'reconnecting');
+
+        const attempt = state.openAiReconnectAttempts;
+        const delayMs = Math.min(10000, this.openAiReconnectDelayMs * (4 ** (attempt - 1)));
+        this.logVoiceEvent('openai_reconnecting', state, {
+            source,
+            code,
+            closeCode,
+            closeReason,
+            attempt,
+            delayMs
+        });
+        const timer = this.reconnectTimerApi.setTimeout(() => {
+            if (state.openAiReconnectTimer !== timer) {
+                return;
+            }
+            state.openAiReconnectTimer = null;
+            this.openOpenAiSocket(state);
+        }, delayMs);
+        state.openAiReconnectTimer = timer;
+        timer?.unref?.();
+        return true;
     }
 
     forwardCallerAudio(state, payload, timestamp = undefined) {
@@ -749,7 +909,16 @@ class RealtimeVoiceBridge {
             this.handleResponseDone(state, event);
         } else if (event.type === 'error') {
             this.logWarning('openai_realtime_error', event.error?.code || event.error?.type);
-            this.finish(state, { code: 1011, reason: 'AI unavailable', closeTwilio: true, closeOpenAi: true });
+            if (isNonRecoverableRealtimeError(event.error)) {
+                this.finish(state, {
+                    code: 1008,
+                    reason: 'AI access denied',
+                    source: 'openai_realtime_error',
+                    closeCode: event.error?.code || event.error?.type,
+                    closeTwilio: true,
+                    closeOpenAi: true
+                });
+            }
         }
     }
 
@@ -764,6 +933,9 @@ class RealtimeVoiceBridge {
         clearTimeout(state.sessionReadyTimer);
         state.sessionReadyTimer = null;
         state.openAiReady = true;
+        state.hasCompletedOpenAiSetup = true;
+        const wasRecovering = state.recoveryGreetingPending;
+        const hadPendingAudio = state.pendingAudio.length > 0;
         const memoryMessage = buildMemoryContextMessage(state.memoryContext);
         if (memoryMessage && !state.memoryContextAdded) {
             if (!sendJson(state.openAiSocket, {
@@ -779,6 +951,23 @@ class RealtimeVoiceBridge {
             }
             state.memoryContextAdded = true;
         }
+        const recoveryContext = wasRecovering ? this.buildRecoveryConversationContext(state) : '';
+        if (recoveryContext && !state.recoveryContextAdded) {
+            if (!sendJson(state.openAiSocket, {
+                type: 'conversation.item.create',
+                item: {
+                    type: 'message',
+                    role: 'user',
+                    content: [{ type: 'input_text', text: recoveryContext }]
+                }
+            }, this.maxBufferedBytes)) {
+                this.recoverOpenAiConnection(state, state.openAiSocket, {
+                    source: 'recovery_context_backpressure'
+                });
+                return;
+            }
+            state.recoveryContextAdded = true;
+        }
         for (const audio of state.pendingAudio) {
             if (!sendJson(state.openAiSocket, { type: 'input_audio_buffer.append', audio }, this.maxBufferedBytes)) {
                 this.finish(state, { code: 1011, reason: 'AI backpressure', closeTwilio: true, closeOpenAi: true });
@@ -787,7 +976,30 @@ class RealtimeVoiceBridge {
         }
         state.pendingAudio = [];
         state.pendingAudioBytes = 0;
-        if (!state.initialGreetingRequested) {
+        if (wasRecovering && !hadPendingAudio) {
+            const greetingEpoch = state.turnEpoch;
+            if (!sendJson(state.openAiSocket, {
+                type: 'response.create',
+                response: {
+                    conversation: 'auto',
+                    output_modalities: ['audio'],
+                    instructions: RECOVERY_GREETING_INSTRUCTIONS,
+                    max_output_tokens: 'inf',
+                    tools: [],
+                    tool_choice: 'none',
+                    metadata: {
+                        response_purpose: RECOVERY_GREETING_PURPOSE,
+                        turn_epoch: String(greetingEpoch)
+                    }
+                }
+            }, this.maxBufferedBytes)) {
+                this.recoverOpenAiConnection(state, state.openAiSocket, {
+                    source: 'recovery_greeting_backpressure'
+                });
+                return;
+            }
+            state.initialGreetingRequested = true;
+        } else if (!state.initialGreetingRequested && !wasRecovering) {
             const greetingEpoch = state.turnEpoch;
             if (!sendJson(state.openAiSocket, {
                 type: 'response.create',
@@ -809,6 +1021,32 @@ class RealtimeVoiceBridge {
             }
             state.initialGreetingRequested = true;
         }
+        state.recoveryGreetingPending = false;
+    }
+
+    buildRecoveryConversationContext(state) {
+        const turns = [];
+        for (const [, turn] of Array.from(state.voiceTurns.entries())
+            .sort((a, b) => a[0] - b[0])
+            .slice(-6)) {
+            const userText = Array.from(turn.userParts.values()).join(' ').trim();
+            const assistantText = Array.from(turn.assistantParts.values())
+                .filter((part) => ['completed', 'incomplete'].includes(part.status))
+                .map((part) => part.text)
+                .join(' ')
+                .trim();
+            if (userText) {
+                turns.push(`Caller: ${userText}`);
+            }
+            if (assistantText) {
+                turns.push(`Assistant: ${assistantText}`);
+            }
+        }
+        if (!turns.length) {
+            return '';
+        }
+        return `The live connection restarted. Use this earlier conversation only as context and do not
+answer it again unless the caller asks:\n${turns.join('\n')}`.slice(0, 12000);
     }
 
     getVoiceTurn(state, turnEpoch) {
@@ -846,7 +1084,7 @@ class RealtimeVoiceBridge {
         }
         const responseState = normalizedResponseId ? state.responseStates.get(normalizedResponseId) : null;
         const finalized = normalizedResponseId ? state.finalizedResponses.get(normalizedResponseId) : null;
-        if (responseState?.purpose === INITIAL_GREETING_PURPOSE) {
+        if (isGreetingPurpose(responseState?.purpose)) {
             return;
         }
         if (finalized && !finalized.keep) {
@@ -887,7 +1125,7 @@ class RealtimeVoiceBridge {
         const isCurrentResponse = !responseState || responseState.turnEpoch === state.turnEpoch;
         const responsePurpose = responseState?.purpose || String(response?.metadata?.response_purpose || '');
         const incompleteReason = response?.status_details?.reason || response?.incomplete_details?.reason;
-        const keep = responsePurpose !== INITIAL_GREETING_PURPOSE && isCurrentResponse && (
+        const keep = !isGreetingPurpose(responsePurpose) && isCurrentResponse && (
             response?.status === 'completed'
             || (response?.status === 'incomplete' && incompleteReason === 'max_output_tokens')
         );
@@ -1261,7 +1499,6 @@ class RealtimeVoiceBridge {
                 'openai_response_failed',
                 response.status_details?.error?.code || response.status_details?.reason
             );
-            this.finish(state, { code: 1011, reason: 'AI response failed', closeTwilio: true, closeOpenAi: true });
             return;
         }
         if (response.status === 'incomplete') {
@@ -1271,7 +1508,7 @@ class RealtimeVoiceBridge {
             if (reason === 'max_output_tokens'
                 && isCurrentResponse
                 && hasAudio
-                && responseState?.purpose !== INITIAL_GREETING_PURPOSE
+                && !isGreetingPurpose(responseState?.purpose)
                 && state.continuationCount < this.maxContinuations) {
                 state.continuationCount += 1;
                 requestedContinuation = sendJson(state.openAiSocket, {
@@ -1308,6 +1545,10 @@ class RealtimeVoiceBridge {
         if (response.status !== 'completed') {
             this.logWarning('openai_response_cancelled', response.status_details?.reason || response.status);
             return;
+        }
+        if (isCurrentResponse && !isGreetingPurpose(responseState?.purpose)) {
+            // Count consecutive connection failures, not unrelated drops over a long healthy call.
+            state.openAiReconnectAttempts = 0;
         }
         if (isCurrentResponse && hasAudio && !this.sendPlaybackMark(state, true)) {
             this.finish(state, { code: 1011, reason: 'call backpressure', closeTwilio: true, closeOpenAi: true });
@@ -1363,6 +1604,7 @@ class RealtimeVoiceBridge {
 
     async executeDeepTool(state, call) {
         const turnEpoch = state.turnEpoch;
+        const openAiGeneration = state.openAiGeneration;
         state.deepToolInFlight = true;
         state.pendingTurnDuringTool = false;
         if (!this.setAutomaticResponses(state, false)) {
@@ -1396,12 +1638,17 @@ class RealtimeVoiceBridge {
                     onWebSearchStart: this.searchCueEnabled
                         && this.aiService?.webSearchEnabled !== false
                         ? () => {
-                            if (!controller.signal.aborted && state.turnEpoch === turnEpoch) {
+                            if (!controller.signal.aborted
+                                && state.turnEpoch === turnEpoch
+                                && state.openAiGeneration === openAiGeneration) {
                                 this.startSearchCue(state);
                             }
                         }
                         : undefined
                 });
+                if (state.openAiGeneration !== openAiGeneration) {
+                    return;
+                }
                 if (result && typeof result === 'object') {
                     answer = String(result.answer || '');
                     searched = Boolean(result.searched);
@@ -1410,6 +1657,9 @@ class RealtimeVoiceBridge {
                     answer = String(result || '');
                 }
             } catch (error) {
+                if (state.openAiGeneration !== openAiGeneration) {
+                    return;
+                }
                 if (!controller.signal.aborted) {
                     this.logWarning('deep_voice_answer_failed', error?.code || error?.status);
                 }
@@ -1417,11 +1667,16 @@ class RealtimeVoiceBridge {
                     ? 'I could not finish the deeper analysis within the time limit. Try asking for a shorter answer or split the question into parts.'
                     : 'I could not complete the deeper analysis just now. Please try that question again.';
             } finally {
-                this.stopSearchCue(state);
+                if (state.openAiGeneration === openAiGeneration) {
+                    this.stopSearchCue(state);
+                }
                 if (state.deepToolAbortController === controller) {
                     state.deepToolAbortController = null;
                 }
             }
+        }
+        if (state.openAiGeneration !== openAiGeneration) {
+            return;
         }
         if (state.totalTokens > this.maxTokens) {
             this.finish(state, { code: 1000, reason: 'usage limit', closeTwilio: true, closeOpenAi: true });
@@ -1472,23 +1727,74 @@ class RealtimeVoiceBridge {
         }, this.maxBufferedBytes);
     }
 
+    pruneSessionEnds() {
+        const now = this.clock();
+        for (const [callSid, entry] of this.sessionEnds) {
+            if (entry.expiresAt <= now) {
+                this.sessionEnds.delete(callSid);
+            }
+        }
+    }
+
+    rememberSessionEnd(callSid, disposition, reason) {
+        const normalizedCallSid = String(callSid || '').trim();
+        if (!normalizedCallSid) {
+            return;
+        }
+        this.pruneSessionEnds();
+        this.sessionEnds.set(normalizedCallSid, {
+            disposition: ['menu', 'recover', 'end'].includes(disposition) ? disposition : 'end',
+            reason: String(reason || 'session ended').slice(0, 80),
+            expiresAt: this.clock() + this.sessionEndTtlMs
+        });
+    }
+
+    getSessionEnd(callSid) {
+        this.pruneSessionEnds();
+        const entry = this.sessionEnds.get(String(callSid || '').trim());
+        return entry ? { disposition: entry.disposition, reason: entry.reason } : null;
+    }
+
     finish(state, {
         code = 1000,
         reason = 'session ended',
+        disposition = 'end',
+        source = undefined,
+        closeCode = undefined,
+        closeReason = undefined,
         closeTwilio = false,
         closeOpenAi = false
     } = {}) {
         if (state.finished) {
             return;
         }
+        const previousPhase = state.phase;
+        const searchActive = state.searchCueActive;
+        const deepToolInFlight = state.deepToolInFlight;
         state.finished = true;
         state.phase = 'finished';
+        this.rememberSessionEnd(state.callSid, disposition, reason);
+        this.logVoiceEvent('session_finished', state, {
+            reason,
+            disposition,
+            source,
+            closeCode,
+            closeReason,
+            previousPhase,
+            searchActive,
+            deepToolInFlight,
+            reconnectAttempts: state.openAiReconnectAttempts
+        });
         this.stopSearchCue(state, { trackBuffered: false });
         this.persistVoiceMemory(state);
         this.pendingStates.delete(state);
         clearTimeout(state.startTimer);
         clearTimeout(state.openAiTimer);
         clearTimeout(state.sessionReadyTimer);
+        if (state.openAiReconnectTimer !== null) {
+            this.reconnectTimerApi.clearTimeout(state.openAiReconnectTimer);
+        }
+        state.openAiReconnectTimer = null;
         clearInterval(state.heartbeatTimer);
         if (state.callSid) {
             this.sessions.delete(state.callSid);
@@ -1544,6 +1850,21 @@ class RealtimeVoiceBridge {
         }
     }
 
+    logVoiceEvent(event, state, details = {}) {
+        const safeDetails = {
+            call: state?.callSid ? String(state.callSid).slice(-8) : undefined,
+            stream: state?.streamSid ? String(state.streamSid).slice(-8) : undefined,
+            phase: state?.phase,
+            twimlRecoveryAttempt: state?.twimlRecoveryAttempt || 0
+        };
+        for (const [key, value] of Object.entries(details)) {
+            if (value !== undefined && value !== null) {
+                safeDetails[key] = String(value).slice(0, 80);
+            }
+        }
+        this.logger.info?.(`[ai-voice] ${event}`, safeDetails);
+    }
+
     close() {
         for (const state of new Set([...this.pendingStates, ...this.sessions.values()])) {
             this.finish(state, { closeTwilio: true, closeOpenAi: true });
@@ -1553,6 +1874,7 @@ class RealtimeVoiceBridge {
         }
         this.server = null;
         this.upgradeHandler = null;
+        this.sessionEnds.clear();
         try {
             this.wss.close();
         } catch (error) {

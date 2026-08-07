@@ -142,8 +142,14 @@ class PhoneService {
         return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${escapeXml(this.getControlsInfoPrompt())}</Say>\n  <Pause length="1"/>\n  <Gather action="/voice/menu" numDigits="1" timeout="10">\n    <Say voice="alice">${menuPrompt}</Say>\n  </Gather>\n  <Say voice="alice">${menuPrompt}</Say>\n</Response>`;
     }
 
-    buildAiStreamTwiML(webSocketUrl, sessionToken) {
-        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Connect>\n    <Stream url="${escapeXmlAttribute(webSocketUrl)}">\n      <Parameter name="sessionToken" value="${escapeXmlAttribute(sessionToken)}"/>\n    </Stream>\n  </Connect>\n  <Redirect method="POST">/voice/menu</Redirect>\n</Response>`;
+    buildAiStreamTwiML(webSocketUrl, sessionToken, { recoveryAttempt = 0 } = {}) {
+        const normalizedAttempt = Math.min(10, Math.max(0, Math.floor(Number(recoveryAttempt) || 0)));
+        const nextAttempt = normalizedAttempt + 1;
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Connect>\n    <Stream url="${escapeXmlAttribute(webSocketUrl)}">\n      <Parameter name="sessionToken" value="${escapeXmlAttribute(sessionToken)}"/>\n      <Parameter name="recoveryAttempt" value="${normalizedAttempt}"/>\n    </Stream>\n  </Connect>\n  <Redirect method="POST">/voice/ai-resume?attempt=${nextAttempt}</Redirect>\n</Response>`;
+    }
+
+    buildAiSessionEndedTwiML(message = 'ChatGPT is temporarily unavailable. Please call again shortly.') {
+        return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Say voice="alice">${escapeXml(message)}</Say>\n  <Hangup/>\n</Response>`;
     }
 
     buildPlaybackTwiML(prompt, audioUrl = null) {

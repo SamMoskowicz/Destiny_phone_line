@@ -75,6 +75,12 @@ const voiceStartLimiter = new DualWindowRateLimiter({
     shortWindowMs: 10 * 60 * 1000,
     longLimit: Number(process.env.AI_VOICE_STARTS_PER_DAY || 10)
 });
+const configuredAiVoiceResumeAttempts = Number(process.env.AI_VOICE_MAX_RESUME_ATTEMPTS);
+const AI_VOICE_MAX_RESUME_ATTEMPTS = Math.max(0, Math.min(3,
+    Number.isFinite(configuredAiVoiceResumeAttempts)
+        ? Math.floor(configuredAiVoiceResumeAttempts)
+        : 1
+));
 const aiVoiceBridge = new RealtimeVoiceBridge({
     apiKey: AI_SAFETY_SALT_CONFIGURED ? process.env.OPENAI_API_KEY : null,
     aiService,
@@ -761,6 +767,36 @@ function getRequestPath(req) {
     return new URL(req.url, 'http://localhost').pathname;
 }
 
+function parseAiResumeAttempt(req) {
+    try {
+        const value = Number(new URL(req?.url || '', 'http://localhost').searchParams.get('attempt'));
+        return Number.isFinite(value) ? Math.min(10, Math.max(0, Math.floor(value))) : 0;
+    } catch (error) {
+        return 0;
+    }
+}
+
+function resolveAiResumeAction({
+    callSid,
+    sessionEnd,
+    recoveryAttempt,
+    maxAttempts = AI_VOICE_MAX_RESUME_ATTEMPTS
+} = {}) {
+    if (sessionEnd?.disposition === 'menu') {
+        return 'menu';
+    }
+    if (sessionEnd?.disposition === 'end') {
+        return 'end';
+    }
+    if (!String(callSid || '').trim()
+        || !Number.isInteger(recoveryAttempt)
+        || recoveryAttempt < 1
+        || recoveryAttempt > maxAttempts) {
+        return 'unavailable';
+    }
+    return 'recover';
+}
+
 function getBodyValue(body, name) {
     const value = body[name];
     return Array.isArray(value) ? value[value.length - 1] : value;
@@ -994,43 +1030,80 @@ async function handleSmsRequest(req, res, body) {
     sendSmsReply(res, messageSid, message);
 }
 
-function startAiVoiceSession(req, res, body, phoneNumber) {
+function startAiVoiceSession(req, res, body, phoneNumber, {
+    recoveryAttempt = 0,
+    automaticRecovery = false
+} = {}) {
+    const sendFailure = (message) => sendTwiml(
+        res,
+        automaticRecovery
+            ? service.buildAiSessionEndedTwiML(message)
+            : service.buildMenuTwiML(message)
+    );
     const callSid = String(getBodyValue(body, 'CallSid') || '');
     const webSocketUrl = buildAiWebSocketUrl(req);
     if (!callSid || !webSocketUrl || !aiVoiceBridge.isConfigured() || !twilioSecurity.hasFixedPublicUrl()) {
-        sendTwiml(res, service.buildMenuTwiML('ChatGPT voice is not configured yet.'));
+        sendFailure('ChatGPT voice is not configured yet.');
         return;
     }
     if (!isAiMemoryReady()) {
-        sendTwiml(res, service.buildMenuTwiML('ChatGPT memory is temporarily unavailable. Please try again later.'));
+        sendFailure('ChatGPT memory is temporarily unavailable. Please try again later.');
         return;
     }
     const normalizedPhoneNumber = normalizeCallerNumber(phoneNumber);
     if (AI_MEMORY_REQUIRED && !normalizedPhoneNumber) {
-        sendTwiml(res, service.buildMenuTwiML('ChatGPT memory requires caller ID. Please call again without blocking your number.'));
+        sendFailure('ChatGPT memory requires caller ID. Please call again without blocking your number.');
         return;
     }
     if (aiVoiceBridge.activeSessionCount >= aiVoiceBridge.maxSessions) {
-        sendTwiml(res, service.buildMenuTwiML('ChatGPT voice is busy. Please try again shortly.'));
+        sendFailure('ChatGPT voice is busy. Please try again shortly.');
         return;
     }
     const safetyIdentifier = createSafetyIdentifier(
         AI_MEMORY_REQUIRED ? normalizedPhoneNumber : phoneNumber,
         AI_SAFETY_SALT
     );
-    const limit = voiceStartLimiter.consume(safetyIdentifier);
-    if (!limit.allowed) {
-        sendTwiml(res, service.buildMenuTwiML('The AI call limit has been reached for now.'));
-        return;
+    if (!automaticRecovery) {
+        const limit = voiceStartLimiter.consume(safetyIdentifier);
+        if (!limit.allowed) {
+            sendFailure('The AI call limit has been reached for now.');
+            return;
+        }
     }
     const sessionToken = aiSessionTokens.issue({ callSid, safetyIdentifier });
-    sendTwiml(res, service.buildAiStreamTwiML(webSocketUrl, sessionToken));
+    sendTwiml(res, service.buildAiStreamTwiML(webSocketUrl, sessionToken, { recoveryAttempt }));
 }
 
 function handleVoiceRequest(req, res, body) {
     const phoneNumber = getBodyValue(body, 'From') || getBodyValue(body, 'phoneNumber') || 'unknown-caller';
     const digits = getBodyValue(body, 'Digits') || getBodyValue(body, 'digits') || '';
     const requestPath = getRequestPath(req);
+
+    if (requestPath === '/voice/ai-resume') {
+        const callSid = String(getBodyValue(body, 'CallSid') || '');
+        const sessionEnd = aiVoiceBridge.getSessionEnd(callSid);
+        const recoveryAttempt = parseAiResumeAttempt(req);
+        const resumeAction = resolveAiResumeAction({ callSid, sessionEnd, recoveryAttempt });
+        if (resumeAction === 'menu') {
+            sendTwiml(res, service.buildMenuTwiML());
+            return;
+        }
+        if (resumeAction === 'end') {
+            sendTwiml(res, service.buildAiSessionEndedTwiML('The ChatGPT session has ended. Goodbye.'));
+            return;
+        }
+        if (resumeAction === 'unavailable') {
+            sendTwiml(res, service.buildAiSessionEndedTwiML(
+                'ChatGPT is temporarily unavailable. Please call again shortly.'
+            ));
+            return;
+        }
+        startAiVoiceSession(req, res, body, phoneNumber, {
+            recoveryAttempt,
+            automaticRecovery: true
+        });
+        return;
+    }
 
     if (requestPath === '/voice/live-continue') {
         // Reached when one live chunk finishes and the caller didn't press
@@ -1453,6 +1526,11 @@ async function handleHttpRequest(req, res) {
         return;
     }
 
+    if (req.method === 'POST' && requestPath === '/voice/ai-resume') {
+        await handleVoiceWebhook(req, res);
+        return;
+    }
+
     if (req.method === 'POST' && requestPath === '/voice/playback') {
         await handleVoiceWebhook(req, res);
         return;
@@ -1625,6 +1703,8 @@ module.exports = {
     startServer,
     shutdown,
     parseBody,
+    parseAiResumeAttempt,
+    resolveAiResumeAction,
     buildSmsTwiML,
     buildAiWebSocketUrl,
     handleHttpRequest

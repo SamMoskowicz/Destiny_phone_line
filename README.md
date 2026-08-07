@@ -94,7 +94,7 @@ Caller profiles have no automatic time-based expiration. They remain until the c
 
 The memory file is encrypted with AES-256-GCM using `AI_MEMORY_ENCRYPTION_KEY` and contains the HMAC-based caller identifier rather than the raw phone number. Rotating either that encryption key or `AI_SAFETY_SALT` makes existing memory unreadable or unreachable. Keep both secrets stable and backed up securely.
 
-Pressing 8 during an active AI voice chat closes the Media Stream and returns to the main menu. The application does not impose a wall-clock duration limit. Voice sessions are limited to 30 turns by default, and repeated silence also ends a call. The upstream OpenAI Realtime service can still impose its own maximum session duration.
+Pressing 8 during an active AI voice chat deliberately closes the Media Stream and returns to the main menu. An unexpected OpenAI disconnect no longer does that: the bridge keeps the Twilio call open and reconnects OpenAI after up to two consecutive failures, preserving recent conversation context and asking the caller to repeat an interrupted question. If the entire Media Stream ends unexpectedly, Twilio makes one bounded attempt to start a fresh AI stream. When recovery is exhausted, the service explains that ChatGPT is unavailable and hangs up instead of dropping the caller into the main menu. The application does not impose a wall-clock duration limit. Voice sessions are limited to 30 turns by default, and repeated silence also ends a call. The upstream OpenAI Realtime service can still impose its own maximum session duration.
 
 All model traffic uses the official OpenAI API endpoints. The key-bearing endpoints are pinned to OpenAI rather than being configurable through `OPENAI_BASE_URL` or a Realtime URL override.
 
@@ -157,6 +157,8 @@ curl -X POST "${RENDER_URL}/admin/stream/recording" \
 - AI_VOICE_SEARCH_CUE_ENABLED: defaults to `true`; locally synthesizes the short status cue when an actual voice web search starts, with no additional OpenAI request
 - AI_VOICE_SEARCH_CUE_DELAY_MS / AI_VOICE_SEARCH_CUE_GAP_MS: default to 650 / 1500; control when the cue begins and the quiet interval between repeats
 - AI_VOICE_MAX_SESSIONS, AI_VOICE_MAX_TURNS, AI_VOICE_MAX_DEEP_CALLS, AI_VOICE_MAX_TOKENS, AI_VOICE_MAX_CONTINUATIONS, AI_VOICE_MAX_IDLE_PROMPTS: voice spend, completion, silence, and concurrency controls
+- AI_VOICE_MAX_OPENAI_RECONNECTS / AI_VOICE_OPENAI_RECONNECT_DELAY_MS: default to 2 / 250; keep the phone call open while temporary Realtime socket failures reconnect with bounded backoff
+- AI_VOICE_MAX_RESUME_ATTEMPTS: defaults to 1; bounds whole-stream recovery so a failed AI call cannot loop or fall through to the main menu
 - AI_SMS_PER_MINUTE, AI_SMS_PER_DAY, AI_SMS_GLOBAL_PER_HOUR, AI_SMS_GLOBAL_PER_DAY, AI_SMS_MAX_CONCURRENT: model-call abuse/spend controls
 - AI_SMS_OUTBOUND_SEGMENTS_PER_HOUR / AI_SMS_OUTBOUND_SEGMENTS_PER_DAY: carrier-spend limits; each AI answer is also capped at three GSM-7 or UCS-2 segments
 
